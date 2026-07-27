@@ -1,0 +1,11 @@
+node_modules/
+dist/
+apps/web/dist/
+apps/server/dist/
+media/*
+!media/.gitkeep
+.env
+.env.local
+.DS_Store
+*.log
+.deploy-state/

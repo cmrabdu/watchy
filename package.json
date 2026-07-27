@@ -1,0 +1,19 @@
+{
+  "name": "watch",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/server",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev:server & npm run dev:web",
+    "dev:server": "npm run dev -w @watch/server -- --env-file=../../.env",
+    "dev:web": "npm run dev -w @watch/web",
+    "build": "npm run build -w @watch/web && npm run build -w @watch/server",
+    "start": "node --env-file=.env apps/server/dist/index.js",
+    "hash-password": "node scripts/hash-password.mjs",
+    "gen-test-video": "bash scripts/gen-test-video.sh",
+    "validate": "node scripts/validate-local.mjs"
+  }
+}
