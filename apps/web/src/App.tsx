@@ -26,6 +26,7 @@ export function App() {
   const [resumeAt, setResumeAt] = useState<number | null>(null);
   const [editing, setEditing] = useState<Movie | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [roomBlurbOpen, setRoomBlurbOpen] = useState(false);
 
   const sync = useSync(user?.username ?? null, active?.id ?? null);
   const isAdmin = user?.role === "admin";
@@ -154,8 +155,22 @@ export function App() {
                 {t("backCatalog")}
               </button>
               <h1>{active.title}</h1>
-              {active.description && (
-                <p className="room-desc">{active.description}</p>
+              {active.description?.trim() && (
+                <button
+                  type="button"
+                  className={`room-blurb${roomBlurbOpen ? " is-open" : ""}`}
+                  onClick={() => setRoomBlurbOpen((v) => !v)}
+                  aria-expanded={roomBlurbOpen}
+                >
+                  {roomBlurbOpen ? (
+                    <>
+                      <span className="room-blurb-body">{active.description}</span>
+                      <em>{t("readLess")}</em>
+                    </>
+                  ) : (
+                    <em className="room-blurb-peek">{t("readMore")}</em>
+                  )}
+                </button>
               )}
             </div>
             <div className="topbar-meta">
@@ -212,6 +227,7 @@ export function App() {
                   isAdmin={isAdmin}
                   onOpen={(resume) => {
                     setResumeAt(resume ? m.progressTime : null);
+                    setRoomBlurbOpen(false);
                     setActive(m);
                   }}
                   onEdit={() => setEditing(m)}
