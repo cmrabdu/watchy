@@ -470,24 +470,28 @@ a {
 }
 
 .poster-meta h2 {
-  margin: 0.1rem 0 0.2rem;
+  margin: 0.1rem 0 0;
   font-size: 0.92rem;
   font-weight: 600;
   line-height: 1.25;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .poster-tech {
-  margin: 0;
+  margin: 0.2rem 0 0;
   color: var(--muted);
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   line-height: 1.3;
+  opacity: 0.85;
 }
 
 .poster-blurb {
-  display: grid;
-  gap: 0.15rem;
+  display: block;
   width: 100%;
-  margin: 0;
+  margin: 0.15rem 0 0;
   padding: 0;
   border: 0;
   background: transparent;
@@ -497,29 +501,48 @@ a {
   font: inherit;
 }
 
-.poster-blurb > span {
-  font-size: 0.75rem;
-  line-height: 1.35;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.poster-blurb.is-open > span {
-  display: block;
-  -webkit-line-clamp: unset;
-}
-
-.poster-blurb > em {
+.poster-blurb-peek {
   font-style: normal;
   font-size: 0.7rem;
-  color: #fda4af;
-  letter-spacing: 0.02em;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: rgba(253, 164, 175, 0.85);
 }
 
-.poster-blurb:hover > em {
+.poster-blurb:hover .poster-blurb-peek {
+  color: #fecdd3;
   text-decoration: underline;
+}
+
+.poster-blurb-body {
+  display: block;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+  animation: blurb-in 160ms ease both;
+}
+
+.poster-blurb.is-open > em {
+  font-style: normal;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: rgba(253, 164, 175, 0.85);
+}
+
+.poster-blurb.is-open:hover > em {
+  text-decoration: underline;
+}
+
+@keyframes blurb-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .poster-admin {

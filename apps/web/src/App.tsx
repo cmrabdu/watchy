@@ -294,8 +294,14 @@ function CatalogCard({
             onClick={() => setOpenBlurb((v) => !v)}
             aria-expanded={openBlurb}
           >
-            <span>{blurb}</span>
-            <em>{openBlurb ? t("readLess") : t("readMore")}</em>
+            {openBlurb ? (
+              <>
+                <span className="poster-blurb-body">{blurb}</span>
+                <em>{t("readLess")}</em>
+              </>
+            ) : (
+              <em className="poster-blurb-peek">{t("readMore")}</em>
+            )}
           </button>
         ) : (
           <p className="poster-tech">{blurb}</p>
