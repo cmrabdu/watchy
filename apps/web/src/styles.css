@@ -627,11 +627,50 @@ a {
   padding: 0.7rem 1rem;
 }
 
-.room-desc {
-  margin: 0.35rem 0 0;
+.room-blurb {
+  display: block;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--muted);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
   max-width: 52ch;
-  line-height: 1.4;
+}
+
+.room-blurb-peek {
+  font-style: normal;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: rgba(253, 164, 175, 0.85);
+}
+
+.room-blurb:hover .room-blurb-peek {
+  color: #fecdd3;
+  text-decoration: underline;
+}
+
+.room-blurb-body {
+  display: block;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+  animation: blurb-in 160ms ease both;
+}
+
+.room-blurb.is-open > em {
+  font-style: normal;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: rgba(253, 164, 175, 0.85);
+}
+
+.room-blurb.is-open:hover > em {
+  text-decoration: underline;
 }
 
 .empty {
