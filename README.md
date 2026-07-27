@@ -44,4 +44,4 @@ In `.env` consumed by Docker Compose, escape bcrypt `$` as `$$` (`bootstrap-vps.
 
 ## License
 
-Private project by [C.M.R.A.B.D.U.](https://github.com/cmrabdu) — made with hard.
+Private project by [@cmrabdu](https://github.com/cmrabdu) — made with ♥.

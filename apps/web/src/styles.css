@@ -121,20 +121,19 @@ a {
   margin-top: auto;
   padding: 1.4rem 1.5rem 1.6rem;
   text-align: center;
-  font-size: 0.78rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.01em;
   color: var(--muted);
 }
 
 .site-credit a {
   color: inherit;
   text-decoration: none;
-  border-bottom: 1px solid transparent;
-  transition: color 160ms ease, border-color 160ms ease;
+  transition: color 160ms ease;
 }
 
 .site-credit a:hover {
   color: #fda4af;
-  border-bottom-color: rgba(253, 164, 175, 0.45);
 }
 
 .lobby,
