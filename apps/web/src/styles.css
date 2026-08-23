@@ -962,3 +962,27 @@ a {
     max-width: none;
   }
 }
+
+.sync-badge[data-state="offline"] {
+  color: var(--danger);
+}
+
+.sync-badge[data-state="idle"] {
+  color: var(--muted);
+}
+
+.peer-stalled {
+  color: #fda4af;
+}
+
+.play-blocked {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid rgba(225, 29, 72, 0.5);
+  border-radius: 14px;
+  background: var(--accent-soft);
+  font-size: 0.92rem;
+}

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import type { Movie } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { Movie, SyncState } from "./api";
 import { streamUrl, subtitleUrl } from "./api";
 import { useI18n } from "./i18n";
 import type { useSync } from "./useSync";
@@ -13,9 +13,15 @@ type Props = {
   startAt?: number | null;
 };
 
-const SEEK_THRESHOLD = 2.8;
-const DRIFT_IGNORE = 1.6;
+/** Contrat docs/PROTOCOLE-SYNC.md — table de correction de derive. */
+const DRIFT_DEADBAND = 0.3;
+const DRIFT_RESOLVED = 0.15;
+const DRIFT_SEEK = 2.5;
+const RATE_FAST = 1.02;
+const RATE_SLOW = 0.98;
+
 const REACTIONS = ["❤️", "😂", "👀", "🔥", "👏", "😱"] as const;
+const SUB_LANG_KEY = "watchy.subtitleLang";
 
 type HlsLike = {
   destroy: () => void;
@@ -23,6 +29,8 @@ type HlsLike = {
   attachMedia: (video: HTMLMediaElement) => void;
   on: (event: string, cb: (...args: unknown[]) => void) => void;
 };
+
+type DriftInfo = { drift: number; state: "synced" | "catching" | "off" };
 
 function maxSeekable(video: HTMLVideoElement): number | null {
   const { seekable } = video;
@@ -36,35 +44,111 @@ function clampTime(video: HTMLVideoElement, t: number): number {
   return Math.max(0, Math.min(t, Math.max(0, end - 0.5)));
 }
 
+function fmtSeconds(v: number, lang: string): string {
+  const txt = v.toFixed(1);
+  return lang === "fr" ? txt.replace(".", ",") : txt;
+}
+
+function readPreferredSubLang(): string {
+  try {
+    return localStorage.getItem(SUB_LANG_KEY) ?? "off";
+  } catch {
+    return "off";
+  }
+}
+
+function writePreferredSubLang(lang: string) {
+  try {
+    localStorage.setItem(SUB_LANG_KEY, lang);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Choisit la piste correspondant a la langue preferee, sinon rien. */
+function pickTrack(movie: Movie, lang: string): string {
+  if (lang === "off") return "off";
+  const hit = movie.subtitles.find(
+    (s) => s.lang.toLowerCase() === lang.toLowerCase(),
+  );
+  return hit ? hit.id : "off";
+}
+
 export function Player({ movie, sync, username, startAt }: Props) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<HlsLike | null>(null);
   const applyingRef = useRef(false);
   const applyGen = useRef(0);
   const resumedRef = useRef(false);
-  const [trackId, setTrackId] = useState<string>("off");
-  const [readyHint, setReadyHint] = useState<string | null>(null);
+  const appliedRef = useRef<SyncState | null>(null);
+  /** Position distante ancree a un instant local : c'est ce qui permet de
+   *  projeter la position attendue entre deux messages du serveur. */
+  const anchorRef = useRef<{
+    mediaTime: number;
+    playing: boolean;
+    at: number;
+  } | null>(null);
+  const correctingRef = useRef(false);
 
-  const mediaKey = `${movie.id}|${streamUrl(movie)}`;
+  const [prefLang, setPrefLang] = useState<string>(() => readPreferredSubLang());
+  const [trackId, setTrackId] = useState<string>(() =>
+    pickTrack(movie, readPreferredSubLang()),
+  );
+  const [readyHint, setReadyHint] = useState<string | null>(null);
+  const [drift, setDrift] = useState<DriftInfo | null>(null);
+  const [blocked, setBlocked] = useState(false);
+
+  // Source figee a l'ouverture : si l'encodage HLS se termine pendant la
+  // seance, on ne detruit pas le lecteur sous leurs pieds.
+  const [pinned, setPinned] = useState(() => ({
+    id: movie.id,
+    url: streamUrl(movie),
+    hls: movie.hasHls,
+    nonce: 0,
+  }));
+  if (pinned.id !== movie.id) {
+    setPinned({
+      id: movie.id,
+      url: streamUrl(movie),
+      hls: movie.hasHls,
+      nonce: 0,
+    });
+  }
+  const upgradeAvailable = streamUrl(movie) !== pinned.url;
+
   const lastBy = sync.state?.updatedBy;
 
+  const peerStalled = sync.peers.find(
+    (p) =>
+      p.name.toLowerCase() !== username.toLowerCase() &&
+      p.stalled &&
+      p.watching === movie.id,
+  );
+
   useEffect(() => {
-    setTrackId("off");
+    const lang = readPreferredSubLang();
+    setPrefLang(lang);
+    setTrackId(pickTrack(movie, lang));
     resumedRef.current = false;
+    anchorRef.current = null;
+    appliedRef.current = null;
+    correctingRef.current = false;
+    setBlocked(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [movie.id]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    const src = streamUrl(movie);
+    const src = pinned.url;
     let destroyed = false;
     hlsRef.current?.destroy();
     hlsRef.current = null;
 
     const setup = async () => {
-      if (movie.hasHls) {
+      if (pinned.hls) {
         const HlsMod = await import("hls.js");
         const Hls = HlsMod.default;
         if (destroyed) return;
@@ -98,11 +182,11 @@ export function Player({ movie, sync, username, startAt }: Props) {
       destroyed = true;
       hlsRef.current?.destroy();
       hlsRef.current = null;
+      video.playbackRate = 1;
       video.removeAttribute("src");
       video.load();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mediaKey]);
+  }, [pinned.url, pinned.hls, pinned.nonce]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -113,7 +197,20 @@ export function Player({ movie, sync, username, startAt }: Props) {
       `track[data-id="${CSS.escape(trackId)}"]`,
     ) as HTMLTrackElement | null;
     if (el?.track) el.track.mode = "showing";
-  }, [trackId]);
+  }, [trackId, movie.subtitles]);
+
+  const chooseTrack = useCallback(
+    (id: string) => {
+      setTrackId(id);
+      const lang =
+        id === "off"
+          ? "off"
+          : (movie.subtitles.find((s) => s.id === id)?.lang ?? "off");
+      setPrefLang(lang);
+      writePreferredSubLang(lang);
+    },
+    [movie.subtitles],
+  );
 
   useEffect(() => {
     const video = videoRef.current;
@@ -139,12 +236,41 @@ export function Player({ movie, sync, username, startAt }: Props) {
       video.removeEventListener("loadedmetadata", tryResume);
       video.removeEventListener("canplay", tryResume);
     };
-  }, [startAt, mediaKey, sync]);
+  }, [startAt, pinned.url, sync.seek]);
 
+  /** Position attendue maintenant, projetee depuis l'ancre. */
+  const expectedNow = useCallback((): number | null => {
+    const a = anchorRef.current;
+    if (!a) return null;
+    if (!a.playing) return a.mediaTime;
+    return a.mediaTime + (Date.now() - a.at) / 1000;
+  }, []);
+
+  const startPlayback = useCallback(async (): Promise<boolean> => {
+    const video = videoRef.current;
+    if (!video) return false;
+    try {
+      await video.play();
+      setBlocked(false);
+      return true;
+    } catch (err) {
+      const name = (err as { name?: string } | null)?.name;
+      // NotAllowedError = pas d'activation utilisateur. Ne jamais avaler :
+      // sinon elle regarde une image figee sans explication.
+      if (name === "NotAllowedError" || name === "NotSupportedError") {
+        setBlocked(true);
+      }
+      return false;
+    }
+  }, []);
+
+  // Application de l'etat distant : transitions play/pause et gros ecarts.
   useEffect(() => {
     const video = videoRef.current;
     const remote = sync.state;
     if (!video || !remote || remote.movieId !== movie.id) return;
+    if (appliedRef.current === remote) return;
+    appliedRef.current = remote;
     if (
       remote.updatedBy?.toLowerCase() === username.toLowerCase() &&
       Date.now() < sync.ignoreUntil.current
@@ -152,22 +278,33 @@ export function Player({ movie, sync, username, startAt }: Props) {
       return;
     }
 
+    // Le serveur envoie un mediaTime deja projete a `serverNow` : on repart
+    // de l'instant de reception pour continuer a le projeter localement.
+    anchorRef.current = {
+      mediaTime: remote.mediaTime,
+      playing: remote.playing,
+      at: sync.stateAt.current || Date.now(),
+    };
+
     const gen = ++applyGen.current;
 
     const apply = async () => {
       applyingRef.current = true;
       try {
         const end = maxSeekable(video);
-        if (end != null && remote.mediaTime > end + 0.75) {
+        const expected = expectedNow() ?? remote.mediaTime;
+        if (end != null && expected > end + 0.75) {
           setReadyHint(t("waitingEncode", { sec: Math.floor(end) }));
           return;
         }
         setReadyHint(null);
 
-        const target = clampTime(video, remote.mediaTime);
-        const drift = Math.abs(video.currentTime - target);
+        const target = clampTime(video, expected);
+        const gap = Math.abs(video.currentTime - target);
 
-        if (drift > SEEK_THRESHOLD) {
+        if (gap > DRIFT_SEEK) {
+          video.playbackRate = 1;
+          correctingRef.current = false;
           video.currentTime = target;
           await new Promise<void>((resolve) => {
             const done = () => {
@@ -182,9 +319,12 @@ export function Player({ movie, sync, username, startAt }: Props) {
         if (applyGen.current !== gen) return;
 
         if (remote.playing && video.paused) {
-          await video.play().catch(() => undefined);
+          const ok = await startPlayback();
+          if (!ok) return;
         } else if (!remote.playing && !video.paused) {
           video.pause();
+          video.playbackRate = 1;
+          correctingRef.current = false;
         }
         sync.setStatus("synced");
       } finally {
@@ -197,19 +337,100 @@ export function Player({ movie, sync, username, startAt }: Props) {
     };
 
     void apply();
-  }, [sync.state, movie.id, sync, username, t]);
+  }, [
+    sync.state,
+    sync.ignoreUntil,
+    sync.stateAt,
+    sync.setStatus,
+    movie.id,
+    username,
+    t,
+    expectedNow,
+    startPlayback,
+  ]);
 
+  // Correction douce continue + mesure honnete de la derive.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const video = videoRef.current;
+      if (!video) return;
+      const expected = expectedNow();
+      if (expected == null || video.readyState < 1) {
+        setDrift(null);
+        return;
+      }
+      const diff = video.currentTime - expected;
+      const abs = Math.abs(diff);
+
+      const nextState: DriftInfo["state"] =
+        abs < DRIFT_DEADBAND ? "synced" : abs < DRIFT_SEEK ? "catching" : "off";
+      setDrift((prev) => {
+        const rounded = Math.round(abs * 10) / 10;
+        if (prev && prev.state === nextState && prev.drift === rounded) {
+          return prev;
+        }
+        return { drift: rounded, state: nextState };
+      });
+
+      const anchor = anchorRef.current;
+      if (!anchor?.playing || video.paused || video.seeking) {
+        if (video.playbackRate !== 1) video.playbackRate = 1;
+        correctingRef.current = false;
+        return;
+      }
+      if (applyingRef.current) return;
+
+      if (abs >= DRIFT_SEEK) {
+        // Saut assume : au-dela de 2,5 s la vitesse ne rattrapera jamais.
+        correctingRef.current = false;
+        video.playbackRate = 1;
+        applyingRef.current = true;
+        video.currentTime = clampTime(video, expected);
+        window.setTimeout(() => {
+          applyingRef.current = false;
+        }, 700);
+        return;
+      }
+
+      if (correctingRef.current) {
+        if (abs < DRIFT_RESOLVED) {
+          video.playbackRate = 1;
+          correctingRef.current = false;
+        } else {
+          const rate = diff < 0 ? RATE_FAST : RATE_SLOW;
+          if (video.playbackRate !== rate) video.playbackRate = rate;
+        }
+        return;
+      }
+
+      if (abs >= DRIFT_DEADBAND) {
+        correctingRef.current = true;
+        video.playbackRate = diff < 0 ? RATE_FAST : RATE_SLOW;
+      } else if (video.playbackRate !== 1) {
+        video.playbackRate = 1;
+      }
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [expectedNow]);
+
+  // Filet de securite : jamais de playbackRate coince au demontage.
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) return;
+    return () => {
+      if (video) video.playbackRate = 1;
+    };
+  }, []);
+
+  useEffect(() => {
     const id = window.setInterval(() => {
-      if (!sync.state?.playing) return;
+      const video = videoRef.current;
+      if (!video) return;
       if (applyingRef.current) return;
       if (video.paused) return;
       sync.heartbeat(video.currentTime, true);
     }, 4000);
-    return () => clearInterval(id);
-  }, [sync, sync.state?.playing]);
+    return () => window.clearInterval(id);
+  }, [sync.heartbeat]);
 
   const emit = (fn: () => void) => {
     if (applyingRef.current) return;
@@ -226,37 +447,53 @@ export function Player({ movie, sync, username, startAt }: Props) {
           preload="auto"
           crossOrigin="use-credentials"
           onPlay={() => {
+            setBlocked(false);
             emit(() => {
               const v = videoRef.current!;
               sync.play(clampTime(v, v.currentTime));
             });
           }}
           onPause={() => {
+            // Verrouillage d'ecran ou appel entrant : le navigateur met en
+            // pause. Ne pas propager, sinon l'autre est arrete sans raison.
+            if (document.visibilityState === "hidden") return;
             emit(() => {
               const v = videoRef.current!;
               if (v.readyState < 3 && !v.seeking) return;
               const end = maxSeekable(v);
               if (end != null && v.currentTime >= end - 0.6) return;
+              v.playbackRate = 1;
+              correctingRef.current = false;
               sync.pause(clampTime(v, v.currentTime));
             });
           }}
           onSeeked={() => {
             emit(() => {
               const v = videoRef.current!;
-              const remote = sync.state?.mediaTime ?? v.currentTime;
-              if (Math.abs(v.currentTime - remote) < DRIFT_IGNORE) return;
+              const expected = expectedNow();
+              if (expected != null && Math.abs(v.currentTime - expected) < 1.2) {
+                return;
+              }
+              v.playbackRate = 1;
+              correctingRef.current = false;
               sync.seek(clampTime(v, v.currentTime), !v.paused);
             });
           }}
-          onWaiting={() => setReadyHint(t("buffering"))}
-          onPlaying={() => setReadyHint(null)}
+          onWaiting={() => {
+            setReadyHint(t("buffering"));
+            sync.stall(true);
+          }}
+          onPlaying={() => {
+            setReadyHint(null);
+            sync.stall(false);
+          }}
         >
           {movie.subtitles.map((tr) => (
             <track
               key={tr.id}
               data-id={tr.id}
               kind="subtitles"
-              srcLang={tr.lang === "und" ? "fr" : tr.lang}
+              srcLang={tr.lang === "und" ? "" : tr.lang}
               label={tr.label}
               src={subtitleUrl(tr)}
             />
@@ -276,12 +513,63 @@ export function Player({ movie, sync, username, startAt }: Props) {
         </div>
       </div>
 
+      {blocked && (
+        <div className="play-blocked">
+          <span>{t("playBlocked")}</span>
+          <button
+            type="button"
+            className="primary-btn"
+            onClick={() => void startPlayback()}
+          >
+            {t("tapToJoin")}
+          </button>
+        </div>
+      )}
+
       <div className="player-tools">
-        <span className="sync-badge" data-state="synced">
-          {t("sharedControl")}
+        <span
+          className="sync-badge"
+          data-state={
+            drift == null
+              ? "idle"
+              : drift.state === "synced"
+                ? "synced"
+                : drift.state === "catching"
+                  ? "resync"
+                  : "offline"
+          }
+        >
+          {drift == null
+            ? t("sharedControl")
+            : drift.state === "synced"
+              ? t("driftSynced", { d: fmtSeconds(drift.drift, lang) })
+              : drift.state === "catching"
+                ? t("driftCatching", { d: fmtSeconds(drift.drift, lang) })
+                : t("driftOff", { d: fmtSeconds(drift.drift, lang) })}
           {lastBy ? ` · ${t("lastBy")} : ${lastBy}` : ""}
         </span>
+        {peerStalled && (
+          <span className="sub-hint peer-stalled">
+            {t("peerLoading", { name: peerStalled.name })}
+          </span>
+        )}
         {readyHint && <span className="sub-hint">{readyHint}</span>}
+        {upgradeAvailable && (
+          <button
+            type="button"
+            className="ghost-btn"
+            onClick={() =>
+              setPinned({
+                id: movie.id,
+                url: streamUrl(movie),
+                hls: movie.hasHls,
+                nonce: pinned.nonce + 1,
+              })
+            }
+          >
+            {t("sourceUpgraded")}
+          </button>
+        )}
 
         <div className="reaction-bar">
           {REACTIONS.map((emoji) => (
@@ -313,7 +601,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
 
         <label className="sub-select">
           <span>{t("subtitles")}</span>
-          <select value={trackId} onChange={(e) => setTrackId(e.target.value)}>
+          <select value={trackId} onChange={(e) => chooseTrack(e.target.value)}>
             <option value="off">{t("subsOff")}</option>
             {movie.subtitles.map((tr) => (
               <option key={tr.id} value={tr.id}>
@@ -322,6 +610,9 @@ export function Player({ movie, sync, username, startAt }: Props) {
             ))}
           </select>
         </label>
+        {prefLang !== "off" && trackId === "off" && (
+          <span className="sub-hint">{t("subPrefMissing", { lang: prefLang })}</span>
+        )}
       </div>
     </div>
   );
