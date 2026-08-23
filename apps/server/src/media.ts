@@ -1,10 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createReadStream, existsSync, statSync } from "node:fs";
-import { getEntry, posterUrl, type AudioTrackMeta } from "./catalog.js";
+import {
+  emptyEntry,
+  loadCatalog,
+  posterUrl,
+  type AudioTrackMeta,
+} from "./catalog.js";
 import { config } from "./config.js";
 import { listProgress } from "./progress.js";
-import { listSubtitles, type SubtitleTrack } from "./subtitles.js";
+import { subtitlesFromEntries, type SubtitleTrack } from "./subtitles.js";
 
 const VIDEO_EXTS = new Set([".mp4", ".webm", ".mkv", ".m4v"]);
 
@@ -30,8 +35,11 @@ export type Movie = {
 
 export async function listMovies(): Promise<Movie[]> {
   await fs.mkdir(config.mediaDir, { recursive: true });
+  // One readdir, one catalog parse, one progress read for the whole listing.
+  // Doing it per film meant O(n²) disk access on every 8 s poll, on 2 vCPU.
   const entries = await fs.readdir(config.mediaDir, { withFileTypes: true });
-  const progress = await listProgress();
+  const names = entries.map((e) => e.name);
+  const [progress, catalog] = await Promise.all([listProgress(), loadCatalog()]);
   const movies: Movie[] = [];
 
   for (const entry of entries) {
@@ -44,8 +52,12 @@ export async function listMovies(): Promise<Movie[]> {
     const id = Buffer.from(entry.name).toString("base64url");
     const stem = entry.name.replace(/\.[^.]+$/, "");
     const hlsMaster = path.join(config.mediaDir, `${stem}.hls`, "master.m3u8");
-    const hasHls = existsSync(hlsMaster);
-    const meta = await getEntry(entry.name);
+    // Derive from the playlist actually on disk. Trusting catalog.hlsReady sent
+    // the client through hls.js on an MP4 URL after the .hls dir was deleted.
+    const hlsPath = existsSync(hlsMaster)
+      ? `${stem}.hls/master.m3u8`
+      : undefined;
+    const meta = catalog.movies[entry.name] ?? emptyEntry(entry.name);
     const prog = progress[id];
     movies.push({
       id,
@@ -53,15 +65,15 @@ export async function listMovies(): Promise<Movie[]> {
       description: meta.description,
       filename: entry.name,
       size: st.size,
-      hasHls: hasHls || meta.hlsReady,
-      hlsPath: hasHls ? `${stem}.hls/master.m3u8` : undefined,
+      hasHls: Boolean(hlsPath),
+      hlsPath,
       posterUrl: (() => {
         const base = posterUrl(meta.poster);
         if (!base) return null;
         const v = meta.indexedAt ?? meta.tmdbId ?? 0;
         return `${base}?v=${v}`;
       })(),
-      subtitles: await listSubtitles(entry.name),
+      subtitles: subtitlesFromEntries(entry.name, names),
       audioTracks: meta.audioTracks,
       preferredAudio: meta.preferredAudio,
       indexedAt: meta.indexedAt,

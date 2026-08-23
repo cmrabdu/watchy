@@ -31,8 +31,8 @@ import {
   resolveMediaRelative,
   resolveMoviePath,
 } from "./media.js";
-import { setProgress } from "./progress.js";
-import { resolveSubtitlePath, srtToVtt } from "./subtitles.js";
+import { getProgress, setProgress } from "./progress.js";
+import { listSubtitles, resolveSubtitlePath, srtToVtt } from "./subtitles.js";
 import { room, type ClientMessage, type ServerMessage } from "./sync.js";
 import {
   getTmdbMovie,
@@ -40,7 +40,7 @@ import {
   saveUploadedPoster,
   searchTmdbMovies,
 } from "./tmdb.js";
-import { sanitizeUploadName, saveUploadStream } from "./upload.js";
+import { isVideoName, sanitizeUploadName, saveUploadStream } from "./upload.js";
 
 type Vars = { username: string; role: Role };
 
@@ -97,8 +97,11 @@ const requireAdmin = async (
   await next();
 };
 
-app.get("/api/health", (c) =>
-  c.json({ ok: true, peers: room.peerCount(), peersList: room.peerNames() }),
+// Public probe: no peer identities here — it is reachable without a cookie.
+app.get("/api/health", (c) => c.json({ ok: true }));
+
+app.get("/api/presence", requireAuth, (c) =>
+  c.json({ peerCount: room.peerCount(), peers: room.peerInfos() }),
 );
 
 app.get("/api/me", (c) => {
@@ -137,7 +140,10 @@ app.get("/api/movies", requireAuth, async (c) => {
   const movies = await listMovies();
   return c.json({
     movies,
+    // `peers` stays string[] for REST compatibility; `peerInfos` matches the
+    // WebSocket contract (PeerInfo[]) and is the one to trust for presence.
     peers: room.peerNames(),
+    peerInfos: room.peerInfos(),
     peerCount: room.peerCount(),
     sync: room.getState(),
   });
@@ -189,8 +195,14 @@ app.put("/api/upload", requireAuth, requireAdmin, async (c) => {
     );
   }
   try {
-    const saved = await saveUploadStream(name, c.req.raw.body);
-    const isVideo = /\.(mp4|webm|mkv|m4v)$/i.test(saved.filename);
+    // Video: never clobber — a same-named upload used to silently destroy a
+    // file that might be playing right now. Subtitles: replacing is the point.
+    const saved = await saveUploadStream(
+      name,
+      c.req.raw.body,
+      isVideoName(name) ? "suffix" : "overwrite",
+    );
+    const isVideo = isVideoName(saved.filename);
     if (isVideo) {
       void indexMedia(saved.filename).catch((err) =>
         console.error("index failed", saved.filename, err),
@@ -344,10 +356,45 @@ app.get("/api/posters/:name", requireAuth, async (c) => {
 app.delete("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
   const resolved = resolveMoviePath(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
+
+  // The .hls ladder is 2–4 GB and the extracted .srt sidecars pile up: deleting
+  // only the video left the disk full on a 40 GB VPS.
+  const stem = resolved.filename.replace(/\.[^.]+$/, "");
+  const removed: string[] = [];
+  const freedBefore = await dirSize(path.join(config.mediaDir, `${stem}.hls`));
+
+  const sidecars = await listSubtitles(resolved.filename);
+  for (const track of sidecars) {
+    const full = path.join(config.mediaDir, track.filename);
+    await fsp.unlink(full).catch(() => undefined);
+    removed.push(track.filename);
+  }
+
+  const hlsDir = path.join(config.mediaDir, `${stem}.hls`);
+  if (fs.existsSync(hlsDir)) {
+    await fsp.rm(hlsDir, { recursive: true, force: true }).catch(() => undefined);
+    removed.push(`${stem}.hls/`);
+  }
+
   await fsp.unlink(resolved.moviePath);
   await removeEntry(resolved.filename);
-  return c.json({ ok: true });
+  return c.json({ ok: true, removed, freedBytes: freedBefore });
 });
+
+async function dirSize(dir: string): Promise<number> {
+  if (!fs.existsSync(dir)) return 0;
+  let total = 0;
+  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) total += await dirSize(full);
+    else {
+      const st = await fsp.stat(full).catch(() => null);
+      if (st) total += st.size;
+    }
+  }
+  return total;
+}
 
 // Persist watch progress from sync controls (shared couple resume)
 room.setProgressHandler((movieId, mediaTime, by) => {
@@ -357,6 +404,12 @@ room.setProgressHandler((movieId, mediaTime, by) => {
   } catch {
     /* ignore bad id */
   }
+});
+
+// Cold start / first open: resume where progress.json left off instead of 0:00
+room.setResumeHandler(async (movieId) => {
+  const prog = await getProgress(movieId).catch(() => null);
+  return prog?.mediaTime ?? null;
 });
 
 // Index existing library on boot (non-blocking)
@@ -403,7 +456,53 @@ const server = serve(
   },
 ) as HttpServer;
 
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",
+  // Refuse the upgrade *before* the handshake. Accepting it and checking the
+  // cookie afterwards let an unauthenticated client reach the frame parser,
+  // where a malformed frame raised an 'error' with no listener and killed the
+  // process (all in-memory sync state with it).
+  verifyClient: (info, done) => {
+    const session = readSessionFromCookieValue(
+      cookieFromHeader(info.req.headers.cookie, SESSION_COOKIE),
+    );
+    if (!session) {
+      done(false, 401, "Unauthorized");
+      return;
+    }
+    done(true);
+  },
+});
+
+// An 'error' with no listener on an EventEmitter is an uncaught exception.
+wss.on("error", (err) => console.error("wss error", err));
+
+/** Application-level keepalive: sleeping phones never send FIN. */
+const PING_MS = 30000;
+type Liveness = { alive: boolean; pingAt: number; peerId: string };
+const liveness = new Map<WebSocket, Liveness>();
+
+const pinger = setInterval(() => {
+  for (const socket of wss.clients) {
+    const st = liveness.get(socket);
+    if (!st) continue;
+    if (!st.alive) {
+      // Missed a full cycle: it is a ghost, not a viewer.
+      socket.terminate();
+      continue;
+    }
+    st.alive = false;
+    st.pingAt = Date.now();
+    try {
+      socket.ping();
+    } catch {
+      socket.terminate();
+    }
+  }
+}, PING_MS);
+pinger.unref?.();
+wss.on("close", () => clearInterval(pinger));
 
 wss.on("connection", (socket: WebSocket, req) => {
   const session = readSessionFromCookieValue(
@@ -411,17 +510,41 @@ wss.on("connection", (socket: WebSocket, req) => {
   );
   const peerId = nanoid();
 
+  // Never let a socket error escape: ws emits 'error' on malformed frames.
+  socket.on("error", () => {
+    try {
+      socket.terminate();
+    } catch {
+      /* already gone */
+    }
+  });
+
   if (!session) {
-    socket.send(JSON.stringify({ type: "error", message: "Unauthorized" } satisfies ServerMessage));
+    socket.send(
+      JSON.stringify({ type: "error", message: "Unauthorized" } satisfies ServerMessage),
+    );
     socket.close();
     return;
   }
 
   const send = (msg: ServerMessage) => {
     if (socket.readyState === socket.OPEN) {
-      socket.send(JSON.stringify(msg));
+      try {
+        socket.send(JSON.stringify(msg));
+      } catch {
+        /* peer went away mid-write */
+      }
     }
   };
+
+  liveness.set(socket, { alive: true, pingAt: Date.now(), peerId });
+  socket.on("pong", () => {
+    const st = liveness.get(socket);
+    if (!st) return;
+    st.alive = true;
+    // Round-trip time feeds latency compensation in the sync room.
+    room.setLatency(peerId, Date.now() - st.pingAt);
+  });
 
   room.connect(peerId, session.u, send);
 
@@ -435,6 +558,7 @@ wss.on("connection", (socket: WebSocket, req) => {
   });
 
   socket.on("close", () => {
+    liveness.delete(socket);
     room.disconnect(peerId);
   });
 });

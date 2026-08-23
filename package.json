@@ -11,6 +11,7 @@
     "dev:server": "npm run dev -w @watch/server -- --env-file=../../.env",
     "dev:web": "npm run dev -w @watch/web",
     "build": "npm run build -w @watch/web && npm run build -w @watch/server",
+    "test": "npm run build -w @watch/server && node --test apps/server/test/*.test.mjs",
     "start": "node --env-file=.env apps/server/dist/index.js",
     "hash-password": "node scripts/hash-password.mjs",
     "gen-test-video": "bash scripts/gen-test-video.sh",
