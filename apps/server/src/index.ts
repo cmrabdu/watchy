@@ -32,7 +32,18 @@ import {
   resolveMoviePath,
 } from "./media.js";
 import { getProgress, setProgress } from "./progress.js";
-import { listSubtitles, resolveSubtitlePath, srtToVtt } from "./subtitles.js";
+import {
+  convertToSrtIfNeeded,
+  listSubtitles,
+  resolveSubtitlePath,
+  srtToVtt,
+} from "./subtitles.js";
+import { listEvenings, recordSession, setEveningNote } from "./history.js";
+import {
+  addToWatchlist,
+  listWatchlist,
+  removeFromWatchlist,
+} from "./watchlist.js";
 import { room, type ClientMessage, type ServerMessage } from "./sync.js";
 import {
   getTmdbMovie,
@@ -186,12 +197,20 @@ app.get("/api/subtitles/:trackId", requireAuth, async (c) => {
   });
 });
 
-app.put("/api/upload", requireAuth, requireAdmin, async (c) => {
+app.put("/api/upload", requireAuth, async (c) => {
   const name = sanitizeUploadName(c.req.query("name") ?? "");
   if (!name) {
     return c.json(
-      { error: "Nom de fichier invalide (mp4/webm/mkv/m4v/vtt/srt)" },
+      { error: "Nom de fichier invalide (mp4/webm/mkv/m4v/vtt/srt/ass/ssa)" },
       400,
+    );
+  }
+  // Subtitles are open to both roles: an 80 kB .srt was the most unfair thing
+  // in the product to refuse. Video stays admin — it is what fills the disk.
+  if (isVideoName(name) && c.get("role") !== "admin") {
+    return c.json(
+      { error: "Les fichiers vidéo sont réservés à l'administrateur" },
+      403,
     );
   }
   try {
@@ -208,7 +227,11 @@ app.put("/api/upload", requireAuth, requireAdmin, async (c) => {
         console.error("index failed", saved.filename, err),
       );
     }
-    return c.json({ ok: true, ...saved });
+    // .ass/.ssa become .srt: the browser cannot render SubStation Alpha.
+    const finalName = isVideo
+      ? saved.filename
+      : await convertToSrtIfNeeded(saved.filename);
+    return c.json({ ...saved, ok: true, filename: finalName });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Upload failed";
     return c.json({ error: message }, 400);
@@ -257,7 +280,8 @@ app.get("/api/tmdb/status", requireAuth, (c) =>
   c.json({ configured: hasTmdb() }),
 );
 
-app.get("/api/tmdb/search", requireAuth, requireAdmin, async (c) => {
+// Open to both roles: she must be able to look a film up to wish for it.
+app.get("/api/tmdb/search", requireAuth, async (c) => {
   if (!hasTmdb()) {
     return c.json({ error: "TMDB_API_KEY non configurée" }, 503);
   }
@@ -353,6 +377,78 @@ app.get("/api/posters/:name", requireAuth, async (c) => {
   });
 });
 
+// --- Watchlist partagée -----------------------------------------------------
+// No video file needed: a wish is a TMDB title, who wanted it, and when.
+
+app.get("/api/watchlist", requireAuth, async (c) =>
+  c.json({ items: await listWatchlist() }),
+);
+
+app.post("/api/watchlist", requireAuth, async (c) => {
+  const body = await c.req.json<{
+    tmdbId?: number;
+    title?: string;
+    year?: string | null;
+    overview?: string;
+    posterUrl?: string | null;
+  }>();
+  const tmdbId = Number(body.tmdbId);
+  let title = String(body.title ?? "").trim();
+  let year = body.year ?? null;
+  let overview = String(body.overview ?? "");
+  let poster = body.posterUrl ?? null;
+
+  // Prefer canonical TMDB data when we have a key; fall back to what the
+  // client sends so the watchlist keeps working without TMDB_API_KEY.
+  if (tmdbId && hasTmdb()) {
+    try {
+      const hit = await getTmdbMovie(tmdbId);
+      title = hit.title;
+      year = hit.release_date?.slice(0, 4) ?? null;
+      overview = hit.overview ?? "";
+      poster = hit.poster_path
+        ? `https://image.tmdb.org/t/p/w342${hit.poster_path}`
+        : null;
+    } catch {
+      /* keep whatever the client provided */
+    }
+  }
+  if (!title) return c.json({ error: "Titre requis" }, 400);
+
+  const { item, already } = await addToWatchlist(
+    {
+      tmdbId: tmdbId || null,
+      title,
+      year,
+      overview,
+      posterUrl: poster,
+    },
+    c.get("username"),
+  );
+  return c.json({ ok: true, item, already });
+});
+
+app.delete("/api/watchlist/:id", requireAuth, async (c) => {
+  const ok = await removeFromWatchlist(c.req.param("id"), c.get("username"));
+  if (!ok) return c.json({ error: "Not found" }, 404);
+  return c.json({ ok: true });
+});
+
+// --- Nos soirées ------------------------------------------------------------
+// Deliberately decoupled from the video files: deleting a film to free disk
+// space must not erase the evening they spent watching it.
+
+app.get("/api/history", requireAuth, async (c) =>
+  c.json({ evenings: await listEvenings() }),
+);
+
+app.patch("/api/history/:id", requireAuth, async (c) => {
+  const body = await c.req.json<{ note?: string }>();
+  const ok = await setEveningNote(c.req.param("id"), String(body.note ?? ""));
+  if (!ok) return c.json({ error: "Not found" }, 404);
+  return c.json({ ok: true });
+});
+
 app.delete("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
   const resolved = resolveMoviePath(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
@@ -404,6 +500,11 @@ room.setProgressHandler((movieId, mediaTime, by) => {
   } catch {
     /* ignore bad id */
   }
+});
+
+// Reactions and time actually spent watching together become "Nos soirées"
+room.setSessionHandler((ev) => {
+  void recordSession(ev).catch((err) => console.error("history failed", err));
 });
 
 // Cold start / first open: resume where progress.json left off instead of 0:00

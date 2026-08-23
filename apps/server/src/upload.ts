@@ -6,7 +6,7 @@ import { pipeline } from "node:stream/promises";
 import { config } from "./config.js";
 
 const VIDEO_EXTS = new Set([".mp4", ".webm", ".mkv", ".m4v"]);
-const SUB_EXTS = new Set([".vtt", ".srt"]);
+const SUB_EXTS = new Set([".vtt", ".srt", ".ass", ".ssa"]);
 
 /**
  * What to do when the destination already exists.
@@ -36,6 +36,10 @@ export function sanitizeUploadName(raw: string): string | null {
 
 export function isVideoName(filename: string): boolean {
   return VIDEO_EXTS.has(path.extname(filename).toLowerCase());
+}
+
+export function isSubtitleName(filename: string): boolean {
+  return SUB_EXTS.has(path.extname(filename).toLowerCase());
 }
 
 /** `film.mkv` -> `film (2).mkv` -> `film (3).mkv` ... */

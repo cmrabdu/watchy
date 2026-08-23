@@ -27,6 +27,33 @@ export type ClientMessage =
   | { type: "ready"; ready: boolean }
   | { type: "away"; away: boolean; reason?: string };
 
+/** A reaction, kept with the exact moment of the film it belongs to. */
+export type SessionReaction = {
+  emoji: string;
+  from: string;
+  /** Wall-clock instant */
+  at: number;
+  /** Position in the film, in seconds */
+  mediaTime: number;
+};
+
+/**
+ * One evening in front of one film. `togetherSeconds` counts only the time
+ * both of them were actually watching the same film while it was playing —
+ * not the time the tab was open.
+ */
+export type WatchSessionEvent = {
+  id: string;
+  movieId: string;
+  startedAt: number;
+  endedAt: number;
+  togetherSeconds: number;
+  peers: string[];
+  reactions: SessionReaction[];
+  /** false while the evening is still running (periodic flush) */
+  closed: boolean;
+};
+
 export type PeerInfo = {
   name: string;
   watching: string | null;
@@ -83,6 +110,8 @@ const DISCONNECT_GRACE_MS = 10 * 60 * 1000;
  */
 const TIE_WINDOW_MS = 1000;
 const MAX_HALF_RTT_MS = 1500;
+/** How often a running evening is written to history.json. */
+const SESSION_FLUSH_MS = 60000;
 /** Contract: the countdown lands about 3 s in the future. */
 const COUNTDOWN_LEAD_MS = 3000;
 
@@ -96,6 +125,17 @@ export class SyncRoom {
   private lastKnown = new Map<string, number>();
   private countdown: { startsAt: number; movieId: string } | null = null;
   private countdownTimer: ReturnType<typeof setTimeout> | null = null;
+  private session: {
+    id: string;
+    movieId: string;
+    startedAt: number;
+    togetherSeconds: number;
+    togetherSince: number | null;
+    peers: Set<string>;
+    reactions: SessionReaction[];
+    lastEmitAt: number;
+  } | null = null;
+  private onSession: ((ev: WatchSessionEvent) => void) | null = null;
   private onProgress:
     | ((movieId: string, mediaTime: number, by: string) => void)
     | null = null;
@@ -105,6 +145,11 @@ export class SyncRoom {
     fn: (movieId: string, mediaTime: number, by: string) => void,
   ) {
     this.onProgress = fn;
+  }
+
+  /** "Nos soirees": the room reports what was actually watched together. */
+  setSessionHandler(fn: (ev: WatchSessionEvent) => void) {
+    this.onSession = fn;
   }
 
   /** Cold-start resume: where progress.json says this movie was left. */
@@ -155,6 +200,7 @@ export class SyncRoom {
     this.broadcastState();
     this.syncTicker();
     this.evaluateCountdown();
+    this.updateTogetherness();
   }
 
   /** Called from the transport on each pong. */
@@ -218,6 +264,7 @@ export class SyncRoom {
     }
     this.clearGrace();
     this.cancelCountdown();
+    this.closeSession();
   }
 
   /** Exposed for the test bench. */
@@ -321,6 +368,7 @@ export class SyncRoom {
         this.broadcastPeers();
         this.syncTicker();
         this.evaluateCountdown();
+        this.updateTogetherness();
         break;
       }
       case "leave":
@@ -332,6 +380,7 @@ export class SyncRoom {
         this.broadcastState();
         this.syncTicker();
         this.evaluateCountdown();
+        this.updateTogetherness();
         break;
       case "play":
       case "pause":
@@ -342,6 +391,7 @@ export class SyncRoom {
           msg.type === "play" ? true : msg.type === "pause" ? false : msg.playing;
         if (!this.applyControl(peer, playing, msg.mediaTime)) break;
         this.persistProgress(peer.username);
+        this.updateTogetherness();
         this.broadcastState();
         break;
       }
@@ -357,6 +407,7 @@ export class SyncRoom {
           this.state.updatedAt = Date.now() - peer.halfRttMs;
         }
         this.rememberPosition();
+        this.updateTogetherness();
         // 50 minutes of uninterrupted playback used to never reach progress.json.
         this.persistProgress(peer.username, PROGRESS_THROTTLE_MS);
         break;
@@ -388,13 +439,28 @@ export class SyncRoom {
       case "reaction": {
         const emoji = String(msg.emoji || "").slice(0, 8);
         if (!REACTION_OK.has(emoji)) return;
+        const at = Date.now();
         const payload: ServerMessage = {
           type: "reaction",
           emoji,
           from: peer.username,
-          at: Date.now(),
+          at,
         };
         for (const p of this.peers.values()) p.send(payload);
+        // Reactions used to be forwarded and dropped. They are the only trace
+        // of the evening, so they are kept with their timecode.
+        if (this.state.movieId) {
+          const session = this.ensureSession(this.state.movieId);
+          session.peers.add(peer.username);
+          if (session.reactions.length < 2000) {
+            session.reactions.push({
+              emoji,
+              from: peer.username,
+              at,
+              mediaTime: Math.round(this.projectedState().mediaTime),
+            });
+          }
+        }
         break;
       }
       default:
@@ -529,10 +595,26 @@ export class SyncRoom {
 
   private onTick() {
     if (!this.peers.size) {
+      this.updateTogetherness();
+      this.closeSession();
       this.syncTicker();
       return;
     }
+    this.updateTogetherness();
+    this.flushSession();
     this.broadcastState();
+  }
+
+  /** Keep history.json current: a server restart must not lose the evening. */
+  private flushSession() {
+    const s = this.session;
+    if (!s || !this.onSession) return;
+    const now = Date.now();
+    if (now - s.lastEmitAt < SESSION_FLUSH_MS) return;
+    const ev = this.sessionEvent(false);
+    if (!ev || (ev.togetherSeconds < 60 && !ev.reactions.length)) return;
+    s.lastEmitAt = now;
+    this.onSession(ev);
   }
 
   private persistProgress(by: string, throttleMs = 0) {
@@ -577,6 +659,87 @@ export class SyncRoom {
     };
     this.rememberPosition();
     return true;
+  }
+
+  private distinctWatchers(movieId: string): string[] {
+    return [
+      ...new Set(this.watchersOf(movieId).map((p) => p.username.toLowerCase())),
+    ];
+  }
+
+  private ensureSession(movieId: string) {
+    if (this.session && this.session.movieId !== movieId) this.closeSession();
+    if (!this.session) {
+      this.session = {
+        id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        movieId,
+        startedAt: Date.now(),
+        togetherSeconds: 0,
+        togetherSince: null,
+        peers: new Set(),
+        reactions: [],
+        lastEmitAt: 0,
+      };
+    }
+    return this.session;
+  }
+
+  /**
+   * Start/stop the "watched together" stopwatch. Called on every state change
+   * and on each tick, so a pause or a departure stops the count immediately
+   * instead of being rounded to the nearest rebroadcast.
+   */
+  private updateTogetherness() {
+    const movieId = this.state.movieId;
+    if (this.session && this.session.movieId !== movieId) this.closeSession();
+
+    const watchers = movieId ? this.distinctWatchers(movieId) : [];
+    const together = Boolean(movieId) && this.state.playing && watchers.length >= 2;
+
+    if (together && movieId) {
+      const session = this.ensureSession(movieId);
+      for (const name of this.watchersOf(movieId)) session.peers.add(name.username);
+      if (session.togetherSince == null) session.togetherSince = Date.now();
+      return;
+    }
+
+    if (this.session?.togetherSince != null) {
+      this.session.togetherSeconds +=
+        (Date.now() - this.session.togetherSince) / 1000;
+      this.session.togetherSince = null;
+    }
+  }
+
+  private sessionEvent(closed: boolean): WatchSessionEvent | null {
+    const s = this.session;
+    if (!s) return null;
+    const pending =
+      s.togetherSince != null ? (Date.now() - s.togetherSince) / 1000 : 0;
+    return {
+      id: s.id,
+      movieId: s.movieId,
+      startedAt: s.startedAt,
+      endedAt: Date.now(),
+      togetherSeconds: Math.round(s.togetherSeconds + pending),
+      peers: [...s.peers],
+      reactions: [...s.reactions],
+      closed,
+    };
+  }
+
+  private closeSession() {
+    const s = this.session;
+    if (!s) return;
+    if (s.togetherSince != null) {
+      s.togetherSeconds += (Date.now() - s.togetherSince) / 1000;
+      s.togetherSince = null;
+    }
+    const ev = this.sessionEvent(true);
+    this.session = null;
+    // A film opened and abandoned in ten seconds is not a memory.
+    if (ev && this.onSession && (ev.togetherSeconds >= 60 || ev.reactions.length)) {
+      this.onSession(ev);
+    }
   }
 
   private projectedState(): SyncState {

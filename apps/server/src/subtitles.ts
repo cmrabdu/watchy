@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { existsSync } from "node:fs";
@@ -176,6 +177,32 @@ export function resolveSubtitlePath(trackId: string): string | null {
   const full = path.join(config.mediaDir, filename);
   if (!existsSync(full)) return null;
   return full;
+}
+
+/**
+ * Browsers cannot display SubStation Alpha. She sends what she finds, so an
+ * uploaded .ass/.ssa is converted to .srt (the name listSubtitles expects) and
+ * the original is dropped. Returns the filename actually kept.
+ */
+export async function convertToSrtIfNeeded(filename: string): Promise<string> {
+  const ext = path.extname(filename).toLowerCase();
+  if (ext !== ".ass" && ext !== ".ssa") return filename;
+  const source = path.join(config.mediaDir, filename);
+  const target = `${filename.slice(0, -ext.length)}.srt`;
+  const targetPath = path.join(config.mediaDir, target);
+  const code = await new Promise<number>((resolve) => {
+    const child = spawn("ffmpeg", ["-y", "-i", source, targetPath], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    child.on("close", (c) => resolve(c ?? 1));
+    child.on("error", () => resolve(1));
+  });
+  if (code !== 0 || !existsSync(targetPath)) {
+    await fs.unlink(source).catch(() => undefined);
+    throw new Error("Conversion du sous-titre impossible (ffmpeg)");
+  }
+  await fs.unlink(source).catch(() => undefined);
+  return target;
 }
 
 export function srtToVtt(srt: string): string {
