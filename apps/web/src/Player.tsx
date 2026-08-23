@@ -121,6 +121,8 @@ export function Player({ movie, sync, username, startAt }: Props) {
   const [levels, setLevels] = useState<QualityLevel[]>([]);
   const [levelId, setLevelId] = useState(-1);
   const [paused, setPaused] = useState(true);
+  const [countdownLeft, setCountdownLeft] = useState<number | null>(null);
+  const [readySent, setReadySent] = useState(false);
 
   // Source figee a l'ouverture : si l'encodage HLS se termine pendant la
   // seance, on ne detruit pas le lecteur sous leurs pieds.
@@ -158,6 +160,8 @@ export function Player({ movie, sync, username, startAt }: Props) {
     appliedRef.current = null;
     correctingRef.current = false;
     setBlocked(false);
+    setReadySent(false);
+    setCountdownLeft(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [movie.id]);
 
@@ -484,6 +488,61 @@ export function Player({ movie, sync, username, startAt }: Props) {
     fn();
   };
 
+  /* ----- Rituel : decompte partage et « je reviens » ----- */
+
+  const me = sync.peers.find(
+    (p) => p.name.toLowerCase() === username.toLowerCase(),
+  );
+  const iAmAway = Boolean(me?.away);
+  const waitingForPeer = readySent && countdownLeft == null;
+
+  const declareReady = useCallback(() => {
+    // Ce clic est aussi l'activation utilisateur dont le navigateur a besoin.
+    setReadySent(true);
+    setBlocked(false);
+    sync.setReady(true);
+  }, [sync]);
+
+  // Le decompte du contrat : chacun compte jusqu'a startsAt, corrige de
+  // l'ecart d'horloge serveur, puis lance.
+  useEffect(() => {
+    const cd = sync.countdown;
+    if (!cd || cd.movieId !== movie.id) {
+      setCountdownLeft(null);
+      return;
+    }
+    let fired = false;
+    const tick = () => {
+      const left = (cd.startsAt - sync.serverTime()) / 1000;
+      if (left <= 0) {
+        if (fired) return;
+        fired = true;
+        setCountdownLeft(null);
+        setReadySent(false);
+        sync.clearCountdown();
+        const video = videoRef.current;
+        if (video && video.paused) void startPlayback();
+        return;
+      }
+      setCountdownLeft(left);
+    };
+    tick();
+    const id = window.setInterval(tick, 100);
+    return () => window.clearInterval(id);
+  }, [sync.countdown, sync.serverTime, sync.clearCountdown, movie.id, startPlayback]);
+
+  const goAway = useCallback(
+    (reason: string) => {
+      const video = videoRef.current;
+      if (video && !video.paused) video.pause();
+      else if (video) sync.pause(clampTime(video, video.currentTime));
+      sync.setAway(true, reason);
+    },
+    [sync],
+  );
+
+  const comeBack = useCallback(() => sync.setAway(false), [sync]);
+
   /* ----- Interface : visibilite, plein ecran, clavier ----- */
 
   const bumpUi = useCallback(() => {
@@ -769,17 +828,60 @@ export function Player({ movie, sync, username, startAt }: Props) {
           </div>
         )}
 
-        {paused && !blocked && (
-          <button
-            type="button"
-            className="v-bigplay"
-            onClick={togglePlay}
-            aria-label={t("play")}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M8 5.5v13l11-6.5z" fill="currentColor" />
-            </svg>
-          </button>
+        {countdownLeft != null && (
+          <div className="v-countdown" aria-live="assertive">
+            <span key={Math.ceil(countdownLeft)} className="v-countdown-num">
+              {Math.ceil(countdownLeft)}
+            </span>
+            <span className="v-countdown-sub">{t("countdownSub")}</span>
+          </div>
+        )}
+
+        {peerAway && paused && countdownLeft == null && (
+          <div className="v-away-card">
+            <span className="v-away-emoji">☕</span>
+            <strong>
+              {t("peerAwayCard", {
+                name: peerAway.name,
+                reason: peerAway.awayReason ?? "",
+              })}
+            </strong>
+          </div>
+        )}
+
+        {paused && !blocked && countdownLeft == null && !peerAway && (
+          <div className="v-center">
+            {peerHere && !readySent && (
+              <div className="v-ready">
+                <p>{t("readyPrompt", { name: peerHere.name })}</p>
+                <button type="button" className="primary-btn" onClick={declareReady}>
+                  {t("readyBtn")}
+                </button>
+              </div>
+            )}
+            {peerHere && waitingForPeer && (
+              <div className="v-ready">
+                <p className="v-ready-wait">
+                  {t("waitingPeer", { name: peerHere.name })}
+                </p>
+                <button type="button" className="ghost-btn" onClick={togglePlay}>
+                  {t("startAnyway")}
+                </button>
+              </div>
+            )}
+            {!peerHere && (
+              <button
+                type="button"
+                className="v-bigplay"
+                onClick={togglePlay}
+                aria-label={t("play")}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M8 5.5v13l11-6.5z" fill="currentColor" />
+                </svg>
+              </button>
+            )}
+          </div>
         )}
 
         <PlayerControls
@@ -821,6 +923,35 @@ export function Player({ movie, sync, username, startAt }: Props) {
           >
             {t("sourceUpgraded")}
           </button>
+        )}
+        {iAmAway ? (
+          <button type="button" className="primary-btn" onClick={comeBack}>
+            {t("brbBack")}
+          </button>
+        ) : (
+          <span className="brb-group">
+            <button
+              type="button"
+              className="brb-btn"
+              onClick={() => goAway(t("brb2"))}
+            >
+              {t("brb")}
+            </button>
+            <button
+              type="button"
+              className="brb-chip"
+              onClick={() => goAway(t("brb5"))}
+            >
+              {t("brb5")}
+            </button>
+            <button
+              type="button"
+              className="brb-chip"
+              onClick={() => goAway(t("brb10"))}
+            >
+              {t("brb10")}
+            </button>
+          </span>
         )}
         <button
           type="button"

@@ -13,6 +13,12 @@ export function PosterImage({ src, title }: Props) {
       setUrl(null);
       return;
     }
+    // Affiche TMDB (absolue) : fetch credentials:"include" est refuse par le
+    // CORS de image.tmdb.org. On la laisse au navigateur telle quelle.
+    if (/^https?:\/\//i.test(src)) {
+      setUrl(src);
+      return;
+    }
     let objectUrl: string | null = null;
     let cancelled = false;
     void fetch(src, { credentials: "include" })

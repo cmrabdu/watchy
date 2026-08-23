@@ -159,6 +159,77 @@ export function uploadPoster(id: string, file: File) {
   });
 }
 
+
+/* --- Watchlist partagee (serveur : GET/POST /api/watchlist, DELETE /:id) --- */
+
+export type WatchlistItem = {
+  id: string;
+  tmdbId: number | null;
+  title: string;
+  year: string | null;
+  overview: string;
+  posterUrl: string | null;
+  addedBy: string;
+  addedAt: number;
+  removedAt?: number;
+  removedBy?: string;
+};
+
+export function fetchWatchlist() {
+  return request<{ items: WatchlistItem[] }>("/api/watchlist");
+}
+
+export function addToWatchlist(input: {
+  tmdbId?: number | null;
+  title: string;
+  year?: string | null;
+  overview?: string;
+  posterUrl?: string | null;
+}) {
+  return request<{ ok: boolean; item: WatchlistItem; already: boolean }>(
+    "/api/watchlist",
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+export function removeFromWatchlist(id: string) {
+  return request<{ ok: boolean }>(`/api/watchlist/${id}`, { method: "DELETE" });
+}
+
+/* --- Nos soirees (serveur : GET /api/history, PATCH /api/history/:id) --- */
+
+export type SessionReaction = {
+  emoji: string;
+  from: string;
+  at: number;
+  mediaTime: number;
+};
+
+export type HistoryEvening = {
+  id: string;
+  movieId: string;
+  title: string;
+  posterUrl: string | null;
+  tmdbId: number | null;
+  startedAt: number;
+  endedAt: number;
+  togetherSeconds: number;
+  peers: string[];
+  reactions: SessionReaction[];
+  note: string | null;
+};
+
+export function fetchHistory() {
+  return request<{ evenings: HistoryEvening[] }>("/api/history");
+}
+
+export function setEveningNote(id: string, note: string) {
+  return request<{ ok: boolean }>(`/api/history/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ note }),
+  });
+}
+
 export function streamUrl(movie: Movie): string {
   if (movie.hasHls && movie.hlsPath) {
     return `/api/hls/${movie.hlsPath}`;

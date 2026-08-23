@@ -20,12 +20,24 @@ import { LangToggle, SiteCredit, useI18n } from "./i18n";
 import { Player } from "./Player";
 import { PosterImage } from "./PosterImage";
 import { UploadDropzone } from "./UploadDropzone";
+import { Nights } from "./Nights";
 import { useSync, type PeerInfo } from "./useSync";
+import { Watchlist } from "./Watchlist";
 
-/** Routage minimal : #/movie/:id, pour survivre a un F5. */
-function movieIdFromHash(): string | null {
-  const m = /^#\/movie\/(.+)$/.exec(location.hash);
-  return m ? decodeURIComponent(m[1]) : null;
+/** Routage minimal par hash, pour survivre a un F5. */
+type Route =
+  | { name: "catalog" }
+  | { name: "movie"; id: string }
+  | { name: "watchlist" }
+  | { name: "nights" };
+
+function parseRoute(): Route {
+  const h = location.hash;
+  const m = /^#\/movie\/(.+)$/.exec(h);
+  if (m) return { name: "movie", id: decodeURIComponent(m[1]) };
+  if (h === "#/watchlist") return { name: "watchlist" };
+  if (h === "#/nights") return { name: "nights" };
+  return { name: "catalog" };
 }
 
 function goToMovie(id: string) {
@@ -42,21 +54,24 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [movies, setMovies] = useState<Movie[]>([]);
   const [restPeers, setRestPeers] = useState<string[]>([]);
-  const [routeId, setRouteId] = useState<string | null>(() => movieIdFromHash());
+  const [route, setRoute] = useState<Route>(() => parseRoute());
   const [resumeAt, setResumeAt] = useState<number | null>(null);
   const [editing, setEditing] = useState<Movie | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [roomBlurbOpen, setRoomBlurbOpen] = useState(false);
 
   useEffect(() => {
-    const onHash = () => setRouteId(movieIdFromHash());
+    const onHash = () => setRoute(parseRoute());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
   const active = useMemo(
-    () => (routeId ? (movies.find((m) => m.id === routeId) ?? null) : null),
-    [routeId, movies],
+    () =>
+      route.name === "movie"
+        ? (movies.find((m) => m.id === route.id) ?? null)
+        : null,
+    [route, movies],
   );
 
   const sync = useSync(user?.username ?? null, active?.id ?? null);
@@ -241,17 +256,24 @@ export function App() {
             startAt={resumeAt}
           />
         </section>
+      ) : route.name === "watchlist" ? (
+        <section className="lobby">
+          <RoomNav route={route} peerLabel={peerLabel} />
+          <Watchlist username={user.username} />
+        </section>
+      ) : route.name === "nights" ? (
+        <section className="lobby">
+          <RoomNav route={route} peerLabel={peerLabel} />
+          <Nights />
+        </section>
       ) : (
         <section className="lobby">
+          <RoomNav route={route} peerLabel={peerLabel} />
           <div className="lobby-head">
             <div>
               <h1>{t("catalog")}</h1>
               <p>{t("catalogHint")}</p>
             </div>
-            <span className="pill">
-              <span className="dot" />
-              {peerLabel}
-            </span>
           </div>
 
           {isAdmin && <UploadDropzone onUploaded={() => void refreshMovies()} />}
@@ -299,6 +321,36 @@ export function App() {
 
       <SiteCredit />
     </div>
+  );
+}
+
+function RoomNav({ route, peerLabel }: { route: Route; peerLabel: string }) {
+  const { t } = useI18n();
+  const tabs: { name: Route["name"]; hash: string; label: string }[] = [
+    { name: "catalog", hash: "#/", label: t("catalog") },
+    { name: "watchlist", hash: "#/watchlist", label: t("wishTab") },
+    { name: "nights", hash: "#/nights", label: t("nightsTab") },
+  ];
+  return (
+    <nav className="room-nav">
+      <div className="room-tabs" role="tablist">
+        {tabs.map((tab) => (
+          <a
+            key={tab.name}
+            href={tab.hash}
+            role="tab"
+            aria-selected={route.name === tab.name}
+            className={route.name === tab.name ? "is-active" : ""}
+          >
+            {tab.label}
+          </a>
+        ))}
+      </div>
+      <span className="pill">
+        <span className="dot" />
+        {peerLabel}
+      </span>
+    </nav>
   );
 }
 
