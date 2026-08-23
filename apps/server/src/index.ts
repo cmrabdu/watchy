@@ -51,7 +51,14 @@ import {
   saveUploadedPoster,
   searchTmdbMovies,
 } from "./tmdb.js";
-import { isVideoName, sanitizeUploadName, saveUploadStream } from "./upload.js";
+import {
+  abortUpload,
+  appendUploadChunk,
+  isVideoName,
+  sanitizeUploadName,
+  saveUploadStream,
+  uploadStatus,
+} from "./upload.js";
 
 type Vars = { username: string; role: Role };
 
@@ -197,6 +204,57 @@ app.get("/api/subtitles/:trackId", requireAuth, async (c) => {
   });
 });
 
+/**
+ * Resumable upload — ask where to restart.
+ *   HEAD /api/upload?name=<file>  ->  Upload-Offset: <bytes already stored>
+ *   GET  /api/upload?name=<file>  ->  the same, as JSON
+ * Registered as GET on purpose: this Hono version routes HEAD to the GET
+ * handler and drops the body, and app.on("HEAD", ...) never matches.
+ */
+app.get("/api/upload", requireAuth, async (c) => {
+  const name = sanitizeUploadName(c.req.query("name") ?? "");
+  if (!name) return c.json({ error: "Nom de fichier invalide" }, 400);
+  if (isVideoName(name) && c.get("role") !== "admin") {
+    return c.json({ error: "Admin uniquement" }, 403);
+  }
+  const status = await uploadStatus(name);
+  return c.json(
+    {
+      filename: name,
+      offset: status.offset,
+      completed: status.completed,
+      updatedAt: status.updatedAt,
+    },
+    200,
+    {
+      "Upload-Offset": String(status.offset),
+      "Upload-Complete": status.completed ? "true" : "false",
+      "Accept-Ranges": "bytes",
+      ...(status.updatedAt
+        ? { "Last-Modified": new Date(status.updatedAt).toUTCString() }
+        : {}),
+    },
+  );
+});
+
+/** Give up on a partial upload and free its bytes. */
+app.delete("/api/upload", requireAuth, async (c) => {
+  const name = sanitizeUploadName(c.req.query("name") ?? "");
+  if (!name) return c.json({ error: "Nom de fichier invalide" }, 400);
+  if (isVideoName(name) && c.get("role") !== "admin") {
+    return c.json({ error: "Admin uniquement" }, 403);
+  }
+  try {
+    const removed = await abortUpload(name);
+    return c.json({ ok: true, removed });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : "Abort failed" },
+      409,
+    );
+  }
+});
+
 app.put("/api/upload", requireAuth, async (c) => {
   const name = sanitizeUploadName(c.req.query("name") ?? "");
   if (!name) {
@@ -213,14 +271,66 @@ app.put("/api/upload", requireAuth, async (c) => {
       403,
     );
   }
+  // Video: never clobber — a same-named upload used to silently destroy a
+  // file that might be playing right now. Subtitles: replacing is the point.
+  const policy = isVideoName(name) ? "suffix" : "overwrite";
+  const contentRange = c.req.header("content-range");
+
+  if (contentRange) {
+    const m = /^bytes\s+(\d+)-(\d+)\/(\d+)$/i.exec(contentRange.trim());
+    if (!m) {
+      return c.json(
+        { error: "Content-Range attendu: bytes <début>-<fin>/<total>" },
+        400,
+      );
+    }
+    const [start, end, total] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    try {
+      const res = await appendUploadChunk(
+        name,
+        c.req.raw.body,
+        start,
+        end,
+        total,
+        policy,
+      );
+      if (!res.complete) {
+        return c.json(
+          { ok: true, complete: false, filename: name, offset: res.offset },
+          200,
+          { "Upload-Offset": String(res.offset) },
+        );
+      }
+      if (isVideoName(res.filename)) {
+        void indexMedia(res.filename).catch((err) =>
+          console.error("index failed", res.filename, err),
+        );
+      }
+      const finalName = isVideoName(res.filename)
+        ? res.filename
+        : await convertToSrtIfNeeded(res.filename);
+      return c.json({
+        ok: true,
+        complete: true,
+        filename: finalName,
+        size: res.size,
+        replaced: res.replaced,
+      });
+    } catch (err) {
+      const offset = (err as { offset?: number }).offset;
+      const message = err instanceof Error ? err.message : "Upload failed";
+      if (typeof offset === "number") {
+        // Tell the truth about where we are instead of corrupting the file.
+        return c.json({ error: message, offset }, 409, {
+          "Upload-Offset": String(offset),
+        });
+      }
+      return c.json({ error: message }, 400);
+    }
+  }
+
   try {
-    // Video: never clobber — a same-named upload used to silently destroy a
-    // file that might be playing right now. Subtitles: replacing is the point.
-    const saved = await saveUploadStream(
-      name,
-      c.req.raw.body,
-      isVideoName(name) ? "suffix" : "overwrite",
-    );
+    const saved = await saveUploadStream(name, c.req.raw.body, policy);
     const isVideo = isVideoName(saved.filename);
     if (isVideo) {
       void indexMedia(saved.filename).catch((err) =>
