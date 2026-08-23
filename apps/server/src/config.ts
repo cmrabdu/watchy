@@ -61,6 +61,11 @@ export const config = {
   maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES ?? 20 * 1024 ** 3),
   /** Free key: https://www.themoviedb.org/settings/api */
   tmdbApiKey: process.env.TMDB_API_KEY?.trim() || "",
+  /**
+   * Optional. Free key: https://www.opensubtitles.com/consumers
+   * Without it the subtitle search disables itself cleanly.
+   */
+  openSubtitlesApiKey: process.env.OPENSUBTITLES_API_KEY?.trim() || "",
 };
 
 if (isProd && !process.env.SESSION_SECRET) {

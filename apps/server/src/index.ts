@@ -18,7 +18,7 @@ import {
   verifySession,
 } from "./auth.js";
 import { config, type Role } from "./config.js";
-import { removeEntry, upsertEntry } from "./catalog.js";
+import { getEntry, removeEntry, upsertEntry } from "./catalog.js";
 import {
   ServerEncodeRefused,
   applyTmdbMatch,
@@ -41,6 +41,13 @@ import {
   srtToVtt,
 } from "./subtitles.js";
 import { listEvenings, recordSession, setEveningNote } from "./history.js";
+import {
+  OpenSubtitlesDisabled,
+  downloadSubtitle,
+  hasOpenSubtitles,
+  movieHash,
+  searchSubtitles,
+} from "./opensubtitles.js";
 import {
   addToWatchlist,
   listWatchlist,
@@ -587,6 +594,85 @@ app.patch("/api/history/:id", requireAuth, async (c) => {
   const ok = await setEveningNote(c.req.param("id"), String(body.note ?? ""));
   if (!ok) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
+});
+
+// --- OpenSubtitles ----------------------------------------------------------
+// Namespaced away from /api/subtitles/:trackId on purpose, so "search" can
+// never be mistaken for a track id. Open to both roles: she is the one who
+// needs Arabic, and western MKVs almost never carry it.
+
+app.get("/api/opensubtitles/status", requireAuth, (c) =>
+  c.json({ configured: hasOpenSubtitles() }),
+);
+
+app.get("/api/opensubtitles/search", requireAuth, async (c) => {
+  if (!hasOpenSubtitles()) {
+    return c.json({ error: new OpenSubtitlesDisabled().message }, 503);
+  }
+  const ref = resolveMovieRef(c.req.query("movieId") ?? "");
+  if (!ref) return c.json({ error: "Not found" }, 404);
+  const languages = (c.req.query("langs") ?? "ar,fr,en")
+    .split(",")
+    .map((l) => l.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 8);
+
+  // Hash first: it matches this exact rip, so the timings already line up.
+  // A ladder-only film has no source bytes, so it falls back to the title.
+  let hash: string | undefined;
+  if (ref.moviePath) {
+    try {
+      hash = (await movieHash(ref.moviePath)).hash;
+    } catch {
+      hash = undefined;
+    }
+  }
+  const entry = await getEntry(ref.filename);
+  const query = hash ? undefined : entry.title || ref.stem;
+
+  try {
+    const results = await searchSubtitles({ hash, query, languages });
+    return c.json({
+      hash: hash ?? null,
+      matchedBy: hash ? "hash" : "title",
+      results: results.slice(0, 25),
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : "OpenSubtitles error" },
+      502,
+    );
+  }
+});
+
+app.post("/api/opensubtitles/download", requireAuth, async (c) => {
+  if (!hasOpenSubtitles()) {
+    return c.json({ error: new OpenSubtitlesDisabled().message }, 503);
+  }
+  const body = await c.req.json<{
+    movieId?: string;
+    fileId?: number;
+    lang?: string;
+  }>();
+  const ref = resolveMovieRef(body.movieId ?? "");
+  if (!ref) return c.json({ error: "Not found" }, 404);
+  const fileId = Number(body.fileId);
+  if (!fileId) return c.json({ error: "fileId requis" }, 400);
+
+  try {
+    const saved = await downloadSubtitle({
+      fileId,
+      stem: ref.stem,
+      lang: String(body.lang ?? "und"),
+    });
+    const tracks = await listSubtitles(ref.filename);
+    return c.json({ ok: true, ...saved, subtitles: tracks });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : "Téléchargement échoué" },
+      502,
+    );
+  }
 });
 
 app.delete("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
