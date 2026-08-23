@@ -276,7 +276,10 @@ export function App() {
             </div>
           </div>
 
-          {isAdmin && <UploadDropzone onUploaded={() => void refreshMovies()} />}
+          <UploadDropzone
+            onUploaded={() => void refreshMovies()}
+            subtitlesOnly={!isAdmin}
+          />
 
           {error && <p className="error">{error}</p>}
 

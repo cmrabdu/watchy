@@ -3,6 +3,20 @@ import type { Movie, SyncState } from "./api";
 import { streamUrl, subtitleUrl } from "./api";
 import { useI18n } from "./i18n";
 import { PlayerControls, persistVolume, type QualityLevel } from "./PlayerControls";
+import {
+  CUE_SCALE_MAX,
+  CUE_SCALE_MIN,
+  OFFSET_STEP,
+  cueToHtml,
+  isRtlText,
+  readCueBox,
+  readCueScale,
+  readOffset,
+  shiftCues,
+  writeCueBox,
+  writeCueScale,
+  writeOffset,
+} from "./subtitles";
 import type { useSync } from "./useSync";
 
 type SyncApi = ReturnType<typeof useSync>;
@@ -122,6 +136,11 @@ export function Player({ movie, sync, username, startAt }: Props) {
   const [levelId, setLevelId] = useState(-1);
   const [paused, setPaused] = useState(true);
   const [countdownLeft, setCountdownLeft] = useState<number | null>(null);
+  const [cues, setCues] = useState<string[]>([]);
+  const [cueScale, setCueScale] = useState(() => readCueScale());
+  const [cueBox, setCueBox] = useState(() => readCueBox());
+  const [subOffset, setSubOffset] = useState(0);
+  const appliedOffset = useRef<Record<string, number>>({});
   const [readySent, setReadySent] = useState(false);
 
   // Source figee a l'ouverture : si l'encodage HLS se termine pendant la
@@ -233,16 +252,83 @@ export function Player({ movie, sync, username, startAt }: Props) {
     };
   }, [pinned.url, pinned.hls, pinned.nonce]);
 
+  // Rendu maison des cues : le natif ne laisse regler ni la taille, ni la
+  // position au-dessus de la barre, ni le sens de lecture.
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     for (const track of [...video.textTracks]) track.mode = "disabled";
-    if (trackId === "off") return;
+    setCues([]);
+    if (trackId === "off") {
+      setSubOffset(0);
+      return;
+    }
     const el = video.querySelector(
       `track[data-id="${CSS.escape(trackId)}"]`,
     ) as HTMLTrackElement | null;
-    if (el?.track) el.track.mode = "showing";
+    const track = el?.track;
+    if (!track) return;
+    track.mode = "hidden";
+
+    const wanted = readOffset(trackId);
+    setSubOffset(wanted);
+
+    const sync = () => {
+      const applied = appliedOffset.current[trackId] ?? 0;
+      if (track.cues && track.cues.length > 0 && applied !== wanted) {
+        shiftCues(track, wanted - applied);
+        appliedOffset.current[trackId] = wanted;
+      }
+      const active = track.activeCues;
+      const list: string[] = [];
+      for (let i = 0; i < (active?.length ?? 0); i += 1) {
+        const cue = active![i] as VTTCue;
+        if (typeof cue.text === "string") list.push(cue.text);
+      }
+      setCues(list);
+    };
+
+    track.addEventListener("cuechange", sync);
+    // Les cues arrivent apres le chargement du fichier : on retente un peu.
+    const poll = window.setInterval(sync, 400);
+    sync();
+    return () => {
+      track.removeEventListener("cuechange", sync);
+      window.clearInterval(poll);
+      track.mode = "disabled";
+    };
   }, [trackId, movie.subtitles]);
+
+  const nudgeOffset = useCallback(
+    (delta: number) => {
+      const video = videoRef.current;
+      if (!video || trackId === "off") return;
+      const next = Math.round((subOffset + delta) * 10) / 10;
+      const el = video.querySelector(
+        `track[data-id="${CSS.escape(trackId)}"]`,
+      ) as HTMLTrackElement | null;
+      if (el?.track?.cues?.length) {
+        shiftCues(el.track, delta);
+        appliedOffset.current[trackId] = next;
+      }
+      setSubOffset(next);
+      writeOffset(trackId, next);
+    },
+    [subOffset, trackId],
+  );
+
+  const changeCueScale = useCallback((v: number) => {
+    const clamped = Math.min(CUE_SCALE_MAX, Math.max(CUE_SCALE_MIN, v));
+    setCueScale(clamped);
+    writeCueScale(clamped);
+  }, []);
+
+  const toggleCueBox = useCallback(() => {
+    setCueBox((prev) => {
+      writeCueBox(!prev);
+      return !prev;
+    });
+  }, []);
 
   const chooseTrack = useCallback(
     (id: string) => {
@@ -783,12 +869,30 @@ export function Player({ movie, sync, username, startAt }: Props) {
               key={tr.id}
               data-id={tr.id}
               kind="subtitles"
-              srcLang={tr.lang === "und" ? "" : tr.lang}
+              // Pas de langue declaree : ne pas mentir en disant « fr ».
+              {...(tr.lang && tr.lang !== "und" ? { srcLang: tr.lang } : {})}
               label={tr.label}
               src={subtitleUrl(tr)}
             />
           ))}
         </video>
+
+        {cues.length > 0 && (
+          <div
+            className="v-cues"
+            data-box={cueBox ? "on" : "off"}
+            style={{ ["--cue-scale" as string]: String(cueScale) }}
+          >
+            {cues.map((text, i) => (
+              <p
+                key={`${i}-${text.slice(0, 12)}`}
+                dir="auto"
+                className={isRtlText(text) ? "is-rtl" : undefined}
+                dangerouslySetInnerHTML={{ __html: cueToHtml(text) }}
+              />
+            ))}
+          </div>
+        )}
 
         <div className="reaction-layer" aria-live="polite">
           {sync.reactions.map((r) => {
@@ -895,6 +999,64 @@ export function Player({ movie, sync, username, startAt }: Props) {
           subtitles={movie.subtitles.map((s) => ({ id: s.id, label: s.label }))}
           trackId={trackId}
           onTrack={chooseTrack}
+          subtitleExtras={
+            trackId === "off" ? undefined : (
+              <div className="v-subsettings">
+                <div className="v-set-row">
+                  <span>{t("subOffset")}</span>
+                  <span className="v-set-ctl">
+                    <button
+                      type="button"
+                      onClick={() => nudgeOffset(-OFFSET_STEP)}
+                      aria-label={t("subEarlier")}
+                    >
+                      −
+                    </button>
+                    <b>
+                      {subOffset > 0 ? "+" : ""}
+                      {fmtSeconds(subOffset, lang)} s
+                    </b>
+                    <button
+                      type="button"
+                      onClick={() => nudgeOffset(OFFSET_STEP)}
+                      aria-label={t("subLater")}
+                    >
+                      +
+                    </button>
+                  </span>
+                </div>
+                <p className="v-set-hint">{t("subOffsetHint")}</p>
+                <div className="v-set-row">
+                  <span>{t("subSize")}</span>
+                  <span className="v-set-ctl">
+                    <button
+                      type="button"
+                      onClick={() => changeCueScale(cueScale - 0.1)}
+                      aria-label={t("subSmaller")}
+                    >
+                      A−
+                    </button>
+                    <b>{Math.round(cueScale * 100)}%</b>
+                    <button
+                      type="button"
+                      onClick={() => changeCueScale(cueScale + 0.1)}
+                      aria-label={t("subBigger")}
+                    >
+                      A+
+                    </button>
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="v-set-toggle"
+                  onClick={toggleCueBox}
+                  aria-pressed={cueBox}
+                >
+                  {cueBox ? t("subBoxOn") : t("subBoxOff")}
+                </button>
+              </div>
+            )
+          }
           levels={levels}
           levelId={levelId}
           onLevel={chooseLevel}

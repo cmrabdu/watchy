@@ -241,44 +241,6 @@ export function subtitleUrl(track: SubtitleTrack): string {
   return `/api/subtitles/${track.id}`;
 }
 
-export function uploadFile(
-  file: File,
-  onProgress?: (pct: number) => void,
-): Promise<{ ok: boolean; filename: string; size: number }> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("PUT", `/api/upload?name=${encodeURIComponent(file.name)}`);
-    xhr.withCredentials = true;
-    xhr.upload.onprogress = (evt) => {
-      if (!evt.lengthComputable || !onProgress) return;
-      onProgress(Math.round((evt.loaded / evt.total) * 100));
-    };
-    xhr.onload = () => {
-      try {
-        const body = JSON.parse(xhr.responseText) as {
-          ok?: boolean;
-          filename?: string;
-          size?: number;
-          error?: string;
-        };
-        if (xhr.status >= 200 && xhr.status < 300 && body.filename) {
-          resolve({
-            ok: true,
-            filename: body.filename,
-            size: body.size ?? file.size,
-          });
-        } else {
-          reject(new Error(body.error || xhr.statusText || "Upload failed"));
-        }
-      } catch {
-        reject(new Error("Upload failed"));
-      }
-    };
-    xhr.onerror = () => reject(new Error("Upload network error"));
-    xhr.send(file);
-  });
-}
-
 export function deleteMovie(id: string) {
   return request<{ ok: boolean }>(`/api/movies/${id}`, { method: "DELETE" });
 }
