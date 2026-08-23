@@ -83,6 +83,8 @@ const DISCONNECT_GRACE_MS = 10 * 60 * 1000;
  */
 const TIE_WINDOW_MS = 1000;
 const MAX_HALF_RTT_MS = 1500;
+/** Contract: the countdown lands about 3 s in the future. */
+const COUNTDOWN_LEAD_MS = 3000;
 
 export class SyncRoom {
   private state: SyncState = defaultState();
@@ -92,6 +94,8 @@ export class SyncRoom {
   private lastPersistAt = new Map<string, number>();
   /** Last known position per movie, so a rejoin does not restart from zero. */
   private lastKnown = new Map<string, number>();
+  private countdown: { startsAt: number; movieId: string } | null = null;
+  private countdownTimer: ReturnType<typeof setTimeout> | null = null;
   private onProgress:
     | ((movieId: string, mediaTime: number, by: string) => void)
     | null = null;
@@ -150,6 +154,7 @@ export class SyncRoom {
     this.broadcastPeers();
     this.broadcastState();
     this.syncTicker();
+    this.evaluateCountdown();
   }
 
   /** Called from the transport on each pong. */
@@ -212,6 +217,75 @@ export class SyncRoom {
       this.ticker = null;
     }
     this.clearGrace();
+    this.cancelCountdown();
+  }
+
+  /** Exposed for the test bench. */
+  pendingCountdown(): { startsAt: number; movieId: string } | null {
+    return this.countdown;
+  }
+
+  /**
+   * Countdown: when every peer watching the current film says it is ready, the
+   * server names a start instant about 3 s out and everyone counts down to it.
+   * The "Pret ?" click doubles as the browser user-gesture that authorises
+   * playback, so it must not be skipped even when only one person is watching.
+   */
+  private evaluateCountdown() {
+    const movieId = this.state.movieId;
+    if (!movieId) {
+      this.cancelCountdown();
+      return;
+    }
+    const watchers = this.watchersOf(movieId);
+    const allReady = watchers.length > 0 && watchers.every((p) => p.ready);
+
+    if (!allReady) {
+      // Someone un-readied or walked away before the start: call it off.
+      this.cancelCountdown();
+      return;
+    }
+    // Already counting down on this film — do not restart the clock.
+    if (
+      this.countdown &&
+      this.countdown.movieId === movieId &&
+      this.countdown.startsAt > Date.now()
+    ) {
+      return;
+    }
+
+    const startsAt = Date.now() + COUNTDOWN_LEAD_MS;
+    this.countdown = { startsAt, movieId };
+    const payload: ServerMessage = { type: "countdown", startsAt, movieId };
+    for (const p of watchers) p.send(payload);
+
+    this.cancelCountdownTimer();
+    this.countdownTimer = setTimeout(() => {
+      this.countdownTimer = null;
+      this.countdown = null;
+      // Contract step 4: ready flags go back to false once we have started.
+      let changed = false;
+      for (const p of this.peers.values()) {
+        if (p.ready) {
+          p.ready = false;
+          changed = true;
+        }
+      }
+      if (changed) this.broadcastPeers();
+    }, COUNTDOWN_LEAD_MS);
+    this.countdownTimer.unref?.();
+  }
+
+  private cancelCountdown() {
+    this.countdown = null;
+    this.cancelCountdownTimer();
+  }
+
+  private cancelCountdownTimer() {
+    if (this.countdownTimer) {
+      clearTimeout(this.countdownTimer);
+      this.countdownTimer = null;
+    }
   }
 
   handle(id: string, msg: ClientMessage) {
@@ -246,6 +320,7 @@ export class SyncRoom {
         this.broadcastState();
         this.broadcastPeers();
         this.syncTicker();
+        this.evaluateCountdown();
         break;
       }
       case "leave":
@@ -256,6 +331,7 @@ export class SyncRoom {
         this.broadcastPeers();
         this.broadcastState();
         this.syncTicker();
+        this.evaluateCountdown();
         break;
       case "play":
       case "pause":
@@ -293,6 +369,7 @@ export class SyncRoom {
       case "ready": {
         peer.ready = Boolean(msg.ready);
         this.broadcastPeers();
+        this.evaluateCountdown();
         break;
       }
       case "away": {

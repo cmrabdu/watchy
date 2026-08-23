@@ -128,3 +128,53 @@ test("F — le pair lointain ne gagne plus systématiquement la course", () => {
   assert.equal(room.getState().playing, false, "le clic réellement premier gagne");
   room.stop();
 });
+
+test("Lot 2 — décompte: émis quand tous les regardeurs sont prêts", async () => {
+  const { room, join, last } = mkRoom();
+  join("a", "lui"); join("b", "elle");
+  room.handle("a", { type: "join", movieId: "F" });
+  room.handle("b", { type: "join", movieId: "F" });
+
+  room.handle("a", { type: "ready", ready: true });
+  assert.equal(last("a", "countdown"), undefined, "un seul prêt ne déclenche rien");
+  assert.equal(room.pendingCountdown(), null);
+
+  const t0 = Date.now();
+  room.handle("b", { type: "ready", ready: true });
+  const cd = last("a", "countdown");
+  assert.ok(cd, "les deux prêts => countdown");
+  assert.equal(cd.movieId, "F");
+  assert.ok(cd.startsAt - t0 > 2000 && cd.startsAt - t0 < 4000, `startsAt ~3 s (${cd.startsAt - t0} ms)`);
+  assert.deepEqual(last("b", "countdown"), cd, "les deux côtés recoivent le même instant");
+
+  await sleep(3300);
+  const peers = last("a", "peers").peers;
+  assert.equal(peers.every((p) => p.ready === false), true, "ready remis à faux après le démarrage");
+  assert.equal(room.pendingCountdown(), null);
+  room.stop();
+});
+
+test("Lot 2 — décompte annulé si quelqu'un se retire avant le départ", async () => {
+  const { room, join, inbox } = mkRoom();
+  join("a", "lui"); join("b", "elle");
+  room.handle("a", { type: "join", movieId: "F" });
+  room.handle("b", { type: "join", movieId: "F" });
+  room.handle("a", { type: "ready", ready: true });
+  room.handle("b", { type: "ready", ready: true });
+  assert.ok(room.pendingCountdown());
+  room.handle("b", { type: "ready", ready: false });
+  assert.equal(room.pendingCountdown(), null, "annulé");
+  inbox.get("a").length = 0;
+  room.handle("b", { type: "ready", ready: true });
+  assert.equal(inbox.get("a").filter((m) => m.type === "countdown").length, 1, "un nouveau décompte est ré-émis");
+  room.stop();
+});
+
+test("Lot 2 — un seul spectateur peut aussi lancer (geste utilisateur navigateur)", () => {
+  const { room, join, last } = mkRoom();
+  join("a", "elle");
+  room.handle("a", { type: "join", movieId: "F" });
+  room.handle("a", { type: "ready", ready: true });
+  assert.ok(last("a", "countdown"), "seule, elle doit pouvoir démarrer");
+  room.stop();
+});
