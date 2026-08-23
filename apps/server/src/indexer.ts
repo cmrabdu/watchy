@@ -14,18 +14,23 @@ import {
   matchMovieFromFilename,
   type TmdbMovieHit,
 } from "./tmdb.js";
+import { audioTracksFromMeta, readHlsMeta } from "./hlsmeta.js";
 
 type FfprobeStream = {
   index: number;
   codec_type?: string;
   codec_name?: string;
   channels?: number;
+  width?: number;
+  height?: number;
+  r_frame_rate?: string;
   tags?: Record<string, string>;
   disposition?: Record<string, number>;
 };
 
 type FfprobeJson = {
   streams?: FfprobeStream[];
+  format?: { duration?: string };
 };
 
 const LANG_LABELS: Record<string, string> = {
@@ -80,6 +85,7 @@ export async function probeFile(filePath: string): Promise<FfprobeJson> {
     "-print_format",
     "json",
     "-show_streams",
+    "-show_format",
     filePath,
   ]);
   if (code !== 0) return { streams: [] };
@@ -243,6 +249,9 @@ export async function applyTmdbMatch(
 
 export async function indexMedia(filename: string): Promise<void> {
   if (indexing.has(filename)) return;
+  // A film shipped as a ladder only has no source to probe: its metadata comes
+  // from the descriptor the encoder wrote, and from TMDB by name.
+  if (filename.endsWith(".hls")) return indexHlsFolder(filename);
   indexing.add(filename);
   try {
     const videoPath = path.join(config.mediaDir, filename);
@@ -294,8 +303,177 @@ export async function indexMedia(filename: string): Promise<void> {
   }
 }
 
-/** Prepare browser-friendly HLS with all audio tracks (H.264/AAC). */
-export function prepareHls(filename: string): void {
+/** Metadata for a film that exists on the server only as a .hls folder. */
+async function indexHlsFolder(virtualName: string): Promise<void> {
+  if (indexing.has(virtualName)) return;
+  indexing.add(virtualName);
+  try {
+    const stem = virtualName.slice(0, -".hls".length);
+    const master = path.join(config.mediaDir, virtualName, "master.m3u8");
+    if (!existsSync(master)) return;
+
+    const prev = await getEntry(virtualName);
+    const meta = await readHlsMeta(stem);
+    const audioTracks = meta ? audioTracksFromMeta(meta) : prev.audioTracks;
+
+    let tmdbHit: TmdbMovieHit | null = null;
+    if (hasTmdb() && prev.metadataSource !== "manual") {
+      try {
+        // Match on the original filename when we know it, else on the stem.
+        tmdbHit = await matchMovieFromFilename(meta?.source || `${stem}.mkv`);
+      } catch (err) {
+        console.warn("TMDB match failed", virtualName, err);
+      }
+    }
+    if (tmdbHit) {
+      await applyTmdbMatch(virtualName, tmdbHit);
+    } else {
+      const poster =
+        prev.poster && existsSync(path.join(config.mediaDir, prev.poster))
+          ? prev.poster
+          : // ffmpeg reads the playlist directly — no source file needed.
+            await ensurePoster(virtualName, master);
+      await upsertEntry(virtualName, {
+        poster: poster ?? prev.poster,
+        ...(poster && !prev.metadataSource
+          ? { metadataSource: "frame" as const }
+          : {}),
+      });
+    }
+
+    await upsertEntry(virtualName, {
+      audioTracks,
+      preferredAudio: prev.preferredAudio ?? audioTracks[0]?.index ?? null,
+      indexedAt: Date.now(),
+      hlsReady: true,
+    });
+  } finally {
+    indexing.delete(virtualName);
+  }
+}
+
+/**
+ * HLS ladder — the encoding that was built and then thrown away.
+ *
+ * The old code assembled a correct `args` array (native resolution, veryfast,
+ * CRF 22, every audio track) then did `void args;` and ran `simpleArgs`
+ * instead: ultrafast, CRF 23, scale=-2:720, one audio track. Every MKV was
+ * watched in 720p ultrafast while the owner believed he was at full quality.
+ *
+ * This is the real ladder now, and it is the same one scripts/transcode-hls.sh
+ * produces, so a film encoded upstream and one encoded here behave alike.
+ */
+
+export type LadderRung = {
+  height: number;
+  videoKbps: number;
+  maxKbps: number;
+  bufKbps: number;
+};
+
+/** Never upscale: a 720p source gets 720p and 480p, not a fake 1080p rung. */
+export function ladderFor(sourceHeight: number): LadderRung[] {
+  const rungs: LadderRung[] = [];
+  if (sourceHeight >= 1080)
+    rungs.push({ height: 1080, videoKbps: 5000, maxKbps: 5350, bufKbps: 7500 });
+  if (sourceHeight >= 720)
+    rungs.push({ height: 720, videoKbps: 2800, maxKbps: 3000, bufKbps: 4200 });
+  if (sourceHeight >= 480 || !rungs.length)
+    rungs.push({ height: 480, videoKbps: 1200, maxKbps: 1300, bufKbps: 1800 });
+  return rungs;
+}
+
+export function buildLadderArgs(opts: {
+  videoPath: string;
+  outDir: string;
+  rungs: LadderRung[];
+  audioCount: number;
+  audioLangs: string[];
+  fps: number;
+  preset: string;
+  segmentSeconds: number;
+}): string[] {
+  const { videoPath, outDir, rungs, audioCount, audioLangs, fps, preset } = opts;
+  const seg = opts.segmentSeconds;
+  const gop = Math.max(1, Math.round(fps * seg));
+
+  const args: string[] = ["-y", "-i", videoPath];
+  args.push(
+    "-filter_complex",
+    rungs
+      .map((r, i) => `[0:v]scale=-2:${r.height}:flags=bicubic[v${i}]`)
+      .join(";"),
+  );
+
+  const varMap: string[] = [];
+  rungs.forEach((r, i) => {
+    args.push("-map", `[v${i}]`);
+    args.push(
+      `-c:v:${i}`, "libx264",
+      "-preset", preset,
+      `-profile:v:${i}`, "high",
+      "-pix_fmt", "yuv420p",
+      // Pinned GOP and no scene-cut keyframes: every rung cuts at the same
+      // instant, which is what lets hls.js switch rungs without shifting the
+      // timeline — and therefore without desynchronising the two of them.
+      `-g:v:${i}`, String(gop),
+      `-keyint_min:v:${i}`, String(gop),
+      `-sc_threshold:v:${i}`, "0",
+      `-force_key_frames:v:${i}`, `expr:gte(t,n_forced*${seg})`,
+      `-b:v:${i}`, `${r.videoKbps}k`,
+      `-maxrate:v:${i}`, `${r.maxKbps}k`,
+      `-bufsize:v:${i}`, `${r.bufKbps}k`,
+    );
+    varMap.push(`v:${i},agroup:aud,name:${r.height}p`);
+  });
+
+  // Every audio track survives as a rendition shared by all rungs.
+  for (let a = 0; a < audioCount; a += 1) {
+    args.push("-map", `0:a:${a}`, `-c:a:${a}`, "aac", `-ac:a:${a}`, "2", `-b:a:${a}`, "128k");
+    const lang = audioLangs[a] || "und";
+    varMap.push(
+      `a:${a},agroup:aud,name:${lang}_${a},language:${lang},default:${a === 0 ? "YES" : "NO"}`,
+    );
+  }
+
+  args.push(
+    "-f", "hls",
+    "-hls_time", String(seg),
+    "-hls_playlist_type", "vod",
+    "-hls_flags", "independent_segments",
+    "-hls_segment_type", "mpegts",
+    "-hls_segment_filename", path.join(outDir, "stream_%v", "seg_%05d.ts"),
+    "-master_pl_name", "master.m3u8",
+    "-var_stream_map", varMap.join(" "),
+    path.join(outDir, "stream_%v", "index.m3u8"),
+  );
+  return args;
+}
+
+export type PrepareOptions = {
+  /**
+   * Must be set explicitly. Encoding on the CX22 (2 vCPU) takes hours for a
+   * two-hour film, competes with playback and fills a 40 GB disk — it is an
+   * acknowledged fallback, never a silent default.
+   */
+  allowServerEncode: boolean;
+  preset?: string;
+  maxHeight?: number;
+};
+
+export class ServerEncodeRefused extends Error {
+  constructor() {
+    super(
+      "Encodage serveur refusé : encodez sur votre machine avec " +
+        "scripts/transcode-hls.sh puis scripts/publish-hls.sh. Pour forcer " +
+        "malgré les 2 vCPU du VPS, renvoyez la requête avec {\"force\":true}.",
+    );
+    this.name = "ServerEncodeRefused";
+  }
+}
+
+export function prepareHls(filename: string, opts: PrepareOptions): void {
+  if (!opts.allowServerEncode) throw new ServerEncodeRefused();
   if (hlsJobs.get(filename)?.status === "running") return;
   hlsJobs.set(filename, { status: "running" });
 
@@ -307,94 +485,58 @@ export function prepareHls(filename: string): void {
       await fs.mkdir(outDir, { recursive: true });
 
       const probe = await probeFile(videoPath);
-      const audio = (probe.streams ?? []).filter((s) => s.codec_type === "audio");
+      const streams = probe.streams ?? [];
+      const audio = streams.filter((s) => s.codec_type === "audio");
       if (!audio.length) throw new Error("Aucune piste audio");
+      const video = streams.find((s) => s.codec_type === "video");
 
-      // Single-quality HLS, all audio mapped. Keep it light for CX23.
-      const args = [
-        "-y",
-        "-i",
+      let height = Number(video?.height ?? 1080);
+      if (!Number.isFinite(height) || height <= 0) height = 1080;
+      if (opts.maxHeight && height > opts.maxHeight) height = opts.maxHeight;
+
+      const fps = parseFps(video?.r_frame_rate);
+      const rungs = ladderFor(height);
+      const segmentSeconds = 4;
+
+      const args = buildLadderArgs({
         videoPath,
-        "-map",
-        "0:v:0",
-        ...audio.flatMap((_, i) => ["-map", `0:a:${i}`]),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "22",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "160k",
-        "-ac",
-        "2",
-        "-f",
-        "hls",
-        "-hls_time",
-        "4",
-        "-hls_playlist_type",
-        "vod",
-        "-hls_flags",
-        "independent_segments",
-        "-master_pl_name",
-        "master.m3u8",
-        "-var_stream_map",
-        `v:0,a:0${audio.length > 1 ? audio.slice(1).map((_, i) => ` a:${i + 1}`).join("") : ""}`,
-        path.join(outDir, "stream_%v.m3u8"),
-      ];
+        outDir,
+        rungs,
+        audioCount: audio.length,
+        audioLangs: audio.map((s) => (s.tags?.language || "und").toLowerCase()),
+        fps,
+        preset: opts.preset ?? "veryfast",
+        segmentSeconds,
+      });
 
-      // Encode-while-watching: EVENT playlist grows; clients can play as segs appear.
-      // Prefer English audio when present (index 2 on Multi Hotel Transylvania).
-      const entry = await getEntry(filename);
-      const audioIdx =
-        entry.preferredAudio != null ? entry.preferredAudio : 0;
-
-      const simpleArgs = [
-        "-y",
-        "-i",
-        videoPath,
-        "-map",
-        "0:v:0",
-        "-map",
-        `0:a:${audioIdx}`,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-vf",
-        "scale=-2:720",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-ac",
-        "2",
-        "-f",
-        "hls",
-        "-hls_time",
-        "6",
-        "-hls_list_size",
-        "0",
-        "-hls_playlist_type",
-        "event",
-        "-hls_flags",
-        "independent_segments",
-        "-hls_segment_filename",
-        path.join(outDir, "seg_%05d.ts"),
-        path.join(outDir, "master.m3u8"),
-      ];
-
-      void args;
-      const { code, stderr } = await run("ffmpeg", simpleArgs);
+      const { code, stderr } = await run("ffmpeg", args);
       if (code !== 0) throw new Error(stderr.slice(-400) || "ffmpeg failed");
+
+      // Same descriptor as the script, so both paths look identical to the server.
+      const duration = Number(probe.format?.duration ?? 0);
+      await fs.writeFile(
+        path.join(outDir, "watchy.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            stem,
+            source: filename,
+            duration,
+            sourceHeight: height,
+            segmentSeconds,
+            variants: rungs.map((r) => r.height),
+            audioTracks: audio.map((s, i) => ({
+              index: i,
+              lang: (s.tags?.language || "und").toLowerCase(),
+              title: s.tags?.title ?? "",
+              codec: s.codec_name ?? "aac",
+            })),
+            encodedAt: Date.now(),
+          },
+          null,
+          2,
+        ),
+      );
 
       await upsertEntry(filename, { hlsReady: true });
       hlsJobs.set(filename, { status: "done" });
@@ -405,4 +547,12 @@ export function prepareHls(filename: string): void {
       });
     }
   })();
+}
+
+function parseFps(raw: string | undefined): number {
+  if (!raw) return 25;
+  const [num, den] = raw.split("/").map(Number);
+  if (!num) return 25;
+  const fps = den ? num / den : num;
+  return Number.isFinite(fps) && fps > 0 ? Math.round(fps) : 25;
 }

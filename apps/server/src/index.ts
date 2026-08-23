@@ -20,6 +20,7 @@ import {
 import { config, type Role } from "./config.js";
 import { removeEntry, upsertEntry } from "./catalog.js";
 import {
+  ServerEncodeRefused,
   applyTmdbMatch,
   getHlsJob,
   indexMedia,
@@ -30,6 +31,7 @@ import {
   openRangeStream,
   resolveMediaRelative,
   resolveMoviePath,
+  resolveMovieRef,
 } from "./media.js";
 import { getProgress, setProgress } from "./progress.js";
 import {
@@ -349,7 +351,7 @@ app.put("/api/upload", requireAuth, async (c) => {
 });
 
 app.patch("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   const body = await c.req.json<{
     title?: string;
@@ -378,7 +380,7 @@ app.patch("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
 });
 
 app.post("/api/movies/:id/index", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   // Allow re-match even if previously manual: wipe lock for this scan
   await upsertEntry(resolved.filename, { metadataSource: null });
@@ -424,7 +426,7 @@ app.post("/api/movies/:id/tmdb", requireAuth, requireAdmin, async (c) => {
   if (!hasTmdb()) {
     return c.json({ error: "TMDB_API_KEY non configurée" }, 503);
   }
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   const body = await c.req.json<{ tmdbId?: number }>();
   const tmdbId = Number(body.tmdbId);
@@ -442,7 +444,7 @@ app.post("/api/movies/:id/tmdb", requireAuth, requireAdmin, async (c) => {
 });
 
 app.put("/api/movies/:id/poster", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   const ct = c.req.header("content-type") || "";
   if (!ct.includes("image/")) {
@@ -460,10 +462,38 @@ app.put("/api/movies/:id/poster", requireAuth, requireAdmin, async (c) => {
   return c.json({ ok: true, poster });
 });
 
+/**
+ * Server-side encoding is a fallback, not the normal path. Encoding a ladder
+ * on 2 vCPU takes hours and competes with playback, so it must be asked for
+ * explicitly with {"force": true}. The normal path is:
+ *   scripts/transcode-hls.sh <film>   puis   scripts/publish-hls.sh <film>
+ */
 app.post("/api/movies/:id/prepare", requireAuth, requireAdmin, async (c) => {
   const resolved = resolveMoviePath(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
-  prepareHls(resolved.filename);
+  const body = await c.req.json<{ force?: boolean; preset?: string; maxHeight?: number }>()
+    .catch(() => ({}) as { force?: boolean; preset?: string; maxHeight?: number });
+  try {
+    prepareHls(resolved.filename, {
+      allowServerEncode: body.force === true,
+      preset: body.preset,
+      maxHeight: body.maxHeight,
+    });
+  } catch (err) {
+    if (err instanceof ServerEncodeRefused) {
+      return c.json(
+        {
+          error: err.message,
+          upstream: {
+            encode: "scripts/transcode-hls.sh <fichier>",
+            publish: "scripts/publish-hls.sh <fichier>",
+          },
+        },
+        409,
+      );
+    }
+    throw err;
+  }
   return c.json({ ok: true, job: getHlsJob(resolved.filename) });
 });
 
@@ -560,31 +590,37 @@ app.patch("/api/history/:id", requireAuth, async (c) => {
 });
 
 app.delete("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
-  if (!resolved) return c.json({ error: "Not found" }, 404);
+  const ref = resolveMovieRef(c.req.param("id"));
+  if (!ref) return c.json({ error: "Not found" }, 404);
 
   // The .hls ladder is 2–4 GB and the extracted .srt sidecars pile up: deleting
   // only the video left the disk full on a 40 GB VPS.
-  const stem = resolved.filename.replace(/\.[^.]+$/, "");
   const removed: string[] = [];
-  const freedBefore = await dirSize(path.join(config.mediaDir, `${stem}.hls`));
+  let freed = await dirSize(ref.hlsDir);
 
-  const sidecars = await listSubtitles(resolved.filename);
+  const sidecars = await listSubtitles(ref.filename);
   for (const track of sidecars) {
     const full = path.join(config.mediaDir, track.filename);
+    const st = await fsp.stat(full).catch(() => null);
     await fsp.unlink(full).catch(() => undefined);
+    if (st) freed += st.size;
     removed.push(track.filename);
   }
 
-  const hlsDir = path.join(config.mediaDir, `${stem}.hls`);
-  if (fs.existsSync(hlsDir)) {
-    await fsp.rm(hlsDir, { recursive: true, force: true }).catch(() => undefined);
-    removed.push(`${stem}.hls/`);
+  if (fs.existsSync(ref.hlsDir)) {
+    await fsp.rm(ref.hlsDir, { recursive: true, force: true }).catch(() => undefined);
+    removed.push(`${ref.stem}.hls/`);
   }
 
-  await fsp.unlink(resolved.moviePath);
-  await removeEntry(resolved.filename);
-  return c.json({ ok: true, removed, freedBytes: freedBefore });
+  if (ref.moviePath && fs.existsSync(ref.moviePath)) {
+    const st = await fsp.stat(ref.moviePath).catch(() => null);
+    await fsp.unlink(ref.moviePath);
+    if (st) freed += st.size;
+    removed.push(ref.filename);
+  }
+
+  await removeEntry(ref.filename);
+  return c.json({ ok: true, removed, freedBytes: freed });
 });
 
 async function dirSize(dir: string): Promise<number> {

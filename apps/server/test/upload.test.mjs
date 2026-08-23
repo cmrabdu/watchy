@@ -79,3 +79,38 @@ test("9 — les extensions de sous-titres acceptées", () => {
   assert.equal(sanitizeUploadName("a.exe"), null);
   assert.equal(sanitizeUploadName("../../etc/passwd"), null);
 });
+
+test("14 — l'échelle ne surclasse jamais la source", async () => {
+  const { ladderFor, buildLadderArgs } = await import("../dist/indexer.js");
+  assert.deepEqual(ladderFor(2160).map((r) => r.height), [1080, 720, 480]);
+  assert.deepEqual(ladderFor(1080).map((r) => r.height), [1080, 720, 480]);
+  assert.deepEqual(ladderFor(720).map((r) => r.height), [720, 480]);
+  assert.deepEqual(ladderFor(480).map((r) => r.height), [480]);
+  assert.deepEqual(ladderFor(360).map((r) => r.height), [480],
+    "une source minuscule garde un seul échelon");
+
+  const args = buildLadderArgs({
+    videoPath: "/x/film.mkv", outDir: "/x/film.hls",
+    rungs: ladderFor(1080), audioCount: 2, audioLangs: ["fre", "ara"],
+    fps: 25, preset: "veryfast", segmentSeconds: 4,
+  });
+  const joined = args.join(" ");
+  assert.ok(!joined.includes("ultrafast"), "plus d'ultrafast");
+  assert.ok(!joined.includes("scale=-2:720 "), "plus de bridage à 720p");
+  assert.equal(args.filter((a) => a === "-map").length, 5, "3 vidéos + 2 audios");
+  // GOP identique sur les trois échelons = frontières de segments alignées.
+  assert.equal(joined.match(/-g:v:\d 100/g).length, 3, "GOP = 25 i/s x 4 s sur chaque échelon");
+  assert.equal(joined.match(/-sc_threshold:v:\d 0/g).length, 3);
+  assert.equal(joined.match(/expr:gte\(t,n_forced\*4\)/g).length, 3);
+  assert.ok(joined.includes("independent_segments"));
+  const vm = args[args.indexOf("-var_stream_map") + 1];
+  assert.equal(vm,
+    "v:0,agroup:aud,name:1080p v:1,agroup:aud,name:720p v:2,agroup:aud,name:480p " +
+    "a:0,agroup:aud,name:fre_0,language:fre,default:YES " +
+    "a:1,agroup:aud,name:ara_1,language:ara,default:NO");
+});
+
+test("14 — l'encodage serveur refuse tant qu'on ne l'assume pas", async () => {
+  const { prepareHls, ServerEncodeRefused } = await import("../dist/indexer.js");
+  assert.throws(() => prepareHls("Film.mkv", { allowServerEncode: false }), ServerEncodeRefused);
+});
