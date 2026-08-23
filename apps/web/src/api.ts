@@ -251,3 +251,142 @@ export function formatBytes(n: number): string {
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }
+
+/* --- Envoi de fichiers reprenable -------------------------------------------
+ * Le serveur expose :
+ *   GET    /api/upload?name=…                    -> { offset } : où reprendre
+ *   PUT    /api/upload?name=…  Content-Range: …  -> ajoute un morceau
+ *   DELETE /api/upload?name=…                    -> abandonne et libère les octets
+ * Un 409 ne signifie pas l'échec : il porte l'offset réel du serveur, et on
+ * repart de là. C'est ce qui permet à un envoi de 8 Go coupé à 95 % de
+ * reprendre au lieu de tout recommencer.
+ */
+
+export type UploadProgress = {
+  pct: number;
+  sent: number;
+  total: number;
+  /** octets/s, mesuré depuis le début de CETTE tentative (0 tant que trop tôt) */
+  rate: number;
+  etaSeconds: number | null;
+};
+
+export type UploadHandle = {
+  promise: Promise<{ filename: string }>;
+  abort(): void;
+};
+
+/** 4 Mo : compromis entre le coût d'une requête et la finesse de la progression. */
+const UPLOAD_CHUNK = 4 * 1024 * 1024;
+
+export function abortUpload(name: string) {
+  return request<{ ok: boolean }>(
+    `/api/upload?name=${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function uploadResumable(
+  file: File,
+  onProgress: (p: UploadProgress) => void,
+): UploadHandle {
+  const controller = new AbortController();
+  let aborted = false;
+
+  const run = async (): Promise<{ filename: string }> => {
+    const query = `/api/upload?name=${encodeURIComponent(file.name)}`;
+
+    // Où le serveur en est-il déjà ? Un envoi neuf répond simplement 0.
+    let offset = 0;
+    try {
+      const status = await request<{ offset: number }>(query);
+      offset = Math.min(Math.max(status.offset ?? 0, 0), file.size);
+    } catch {
+      offset = 0;
+    }
+
+    const startedAt = Date.now();
+    const startOffset = offset;
+    const emit = () => {
+      const elapsed = (Date.now() - startedAt) / 1000;
+      const moved = offset - startOffset;
+      const rate = elapsed > 0.5 && moved > 0 ? moved / elapsed : 0;
+      const remaining = file.size - offset;
+      onProgress({
+        pct: file.size ? Math.round((offset / file.size) * 100) : 100,
+        sent: offset,
+        total: file.size,
+        rate,
+        etaSeconds: rate > 0 ? Math.round(remaining / rate) : null,
+      });
+    };
+    emit();
+
+    while (offset < file.size) {
+      if (aborted) throw new Error("aborted");
+      const end = Math.min(offset + UPLOAD_CHUNK, file.size);
+
+      let res: Response;
+      try {
+        res = await fetch(query, {
+          method: "PUT",
+          credentials: "include",
+          signal: controller.signal,
+          headers: {
+            "Content-Range": `bytes ${offset}-${end - 1}/${file.size}`,
+          },
+          body: file.slice(offset, end),
+        });
+      } catch (err) {
+        if (aborted || (err as Error)?.name === "AbortError") {
+          throw new Error("aborted");
+        }
+        throw err;
+      }
+
+      // 409 : le serveur a un autre offset que le nôtre. Il le dit, on le suit.
+      if (res.status === 409) {
+        const body = (await res.json().catch(() => ({}))) as { offset?: number };
+        const real = Number(
+          body.offset ?? res.headers.get("Upload-Offset") ?? Number.NaN,
+        );
+        if (!Number.isFinite(real) || real === offset) {
+          throw new Error("Reprise impossible : le serveur et le client ne s'accordent pas");
+        }
+        offset = Math.min(Math.max(real, 0), file.size);
+        emit();
+        continue;
+      }
+
+      if (!res.ok) {
+        let message = res.statusText;
+        try {
+          const body = (await res.json()) as { error?: string };
+          if (body.error) message = body.error;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(message);
+      }
+
+      const body = (await res.json()) as {
+        complete: boolean;
+        offset?: number;
+        filename?: string;
+      };
+      offset = body.complete ? file.size : Math.min(body.offset ?? end, file.size);
+      emit();
+      if (body.complete) return { filename: body.filename ?? file.name };
+    }
+
+    return { filename: file.name };
+  };
+
+  return {
+    promise: run(),
+    abort() {
+      aborted = true;
+      controller.abort();
+    },
+  };
+}
