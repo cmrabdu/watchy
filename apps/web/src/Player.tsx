@@ -383,6 +383,23 @@ export function Player({ movie, sync, username, startAt }: Props) {
     return a.mediaTime + (Date.now() - a.at) / 1000;
   }, []);
 
+  /**
+   * Une action locale (play, pause, seek) deplace la reference tout de suite.
+   * Sans ca l'ancre restait sur l'ancienne position jusqu'au prochain message
+   * du serveur, et la boucle de correction ramenait le film en arriere.
+   */
+  const anchorLocal = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    anchorRef.current = {
+      mediaTime: video.currentTime,
+      playing: !video.paused,
+      at: Date.now(),
+    };
+    correctingRef.current = false;
+    video.playbackRate = 1;
+  }, []);
+
   const startPlayback = useCallback(async (): Promise<boolean> => {
     const video = videoRef.current;
     if (!video) return false;
@@ -408,20 +425,23 @@ export function Player({ movie, sync, username, startAt }: Props) {
     if (!video || !remote || remote.movieId !== movie.id) return;
     if (appliedRef.current === remote) return;
     appliedRef.current = remote;
+
+    // Le serveur envoie un mediaTime deja projete a `serverNow` : on repart
+    // de l'instant de reception pour continuer a le projeter localement.
+    // Pose avant tout retour anticipe : meme l'echo de ma propre action est
+    // une reference valable, et l'ignorer laissait une ancre perimee.
+    anchorRef.current = {
+      mediaTime: remote.mediaTime,
+      playing: remote.playing,
+      at: sync.stateAt.current || Date.now(),
+    };
+
     if (
       remote.updatedBy?.toLowerCase() === username.toLowerCase() &&
       Date.now() < sync.ignoreUntil.current
     ) {
       return;
     }
-
-    // Le serveur envoie un mediaTime deja projete a `serverNow` : on repart
-    // de l'instant de reception pour continuer a le projeter localement.
-    anchorRef.current = {
-      mediaTime: remote.mediaTime,
-      playing: remote.playing,
-      at: sync.stateAt.current || Date.now(),
-    };
 
     const gen = ++applyGen.current;
 
@@ -558,14 +578,19 @@ export function Player({ movie, sync, username, startAt }: Props) {
     };
   }, []);
 
+  // Cadence de 4 s tenue par une horloge fine : l'ancienne version sautait
+  // le battement entier si la correction en cours tombait sur le tick, et le
+  // serveur restait alors des dizaines de secondes sans nouvelle position.
   useEffect(() => {
+    let lastSent = 0;
     const id = window.setInterval(() => {
       const video = videoRef.current;
-      if (!video) return;
-      if (applyingRef.current) return;
-      if (video.paused) return;
+      if (!video || video.paused || video.seeking) return;
+      const now = Date.now();
+      if (now - lastSent < 3900) return;
+      lastSent = now;
       sync.heartbeat(video.currentTime, true);
-    }, 4000);
+    }, 500);
     return () => window.clearInterval(id);
   }, [sync.heartbeat]);
 
@@ -823,6 +848,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
           onPlay={() => {
             setPaused(false);
             setBlocked(false);
+            if (!applyingRef.current) anchorLocal();
             emit(() => {
               const v = videoRef.current!;
               sync.play(clampTime(v, v.currentTime));
@@ -830,6 +856,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
           }}
           onPause={() => {
             setPaused(true);
+            if (!applyingRef.current) anchorLocal();
             // Verrouillage d'ecran ou appel entrant : le navigateur met en
             // pause. Ne pas propager, sinon l'autre est arrete sans raison.
             if (document.visibilityState === "hidden") return;
@@ -844,6 +871,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
             });
           }}
           onSeeked={() => {
+            if (!applyingRef.current) anchorLocal();
             emit(() => {
               const v = videoRef.current!;
               const expected = expectedNow();
@@ -990,6 +1018,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
 
         <PlayerControls
           video={videoEl}
+          fallbackDuration={movie.duration ?? undefined}
           visible={uiVisible}
           onActivity={bumpUi}
           onTogglePlay={togglePlay}

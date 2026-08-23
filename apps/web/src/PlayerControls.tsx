@@ -12,6 +12,8 @@ export type QualityLevel = { id: number; label: string; active: boolean };
 
 type Props = {
   video: HTMLVideoElement | null;
+  /** Duree connue du serveur, le temps que le manifeste HLS se charge. */
+  fallbackDuration?: number;
   visible: boolean;
   onActivity: () => void;
   onTogglePlay: () => void;
@@ -71,6 +73,7 @@ function readVolume(): { volume: number; muted: boolean } {
 
 export function PlayerControls({
   video,
+  fallbackDuration,
   visible,
   onActivity,
   onTogglePlay,
@@ -90,7 +93,7 @@ export function PlayerControls({
 }: Props) {
   const { t } = useI18n();
   const [current, setCurrent] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [duration, setDuration] = useState(fallbackDuration ?? 0);
   const [buffered, setBuffered] = useState(0);
   const [paused, setPaused] = useState(true);
   const [volume, setVolume] = useState(() => readVolume().volume);
@@ -106,7 +109,11 @@ export function PlayerControls({
     if (!video) return;
     const onTime = () => setCurrent(video.currentTime);
     const onMeta = () => {
-      setDuration(Number.isFinite(video.duration) ? video.duration : 0);
+      setDuration(
+        Number.isFinite(video.duration) && video.duration > 0
+          ? video.duration
+          : (fallbackDuration ?? 0),
+      );
       setCurrent(video.currentTime);
     };
     const onState = () => setPaused(video.paused);
@@ -138,7 +145,7 @@ export function PlayerControls({
       video.removeEventListener("progress", onProgress);
       video.removeEventListener("volumechange", onVol);
     };
-  }, [video]);
+  }, [video, fallbackDuration]);
 
   // Volume memorise d'une soiree a l'autre.
   useEffect(() => {

@@ -35,6 +35,12 @@ export type Movie = {
   metadataSource: "tmdb" | "manual" | "frame" | null;
   progressTime: number | null;
   progressAt: number | null;
+  /** Film livre en echelle HLS seule, sans fichier source sur le disque. */
+  hlsOnly?: boolean;
+  /** Hauteurs de l'echelle, ex. [1080, 720, 480]. Vide pour un fichier simple. */
+  variants?: number[];
+  /** Duree en secondes, quand l'encodeur l'a notee. */
+  duration?: number | null;
 };
 
 export type SyncState = {
