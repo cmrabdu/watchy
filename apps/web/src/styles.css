@@ -1887,7 +1887,7 @@ a {
 }
 
 .player-wrap[data-ui="on"] .v-cues {
-  bottom: 17%;
+  bottom: calc(var(--controls-h, 5rem) + 0.6rem);
 }
 
 .v-cues p {
@@ -2001,4 +2001,104 @@ a {
   display: grid;
   gap: 0.4rem;
   justify-items: start;
+}
+
+/* Les reactions ne doivent pas flotter derriere la barre de controle. */
+.player-wrap[data-ui="on"] .reaction-layer {
+  padding-bottom: calc(var(--controls-h, 5rem) + 0.6rem);
+}
+
+/* --- Barre de controle sur telephone : elle doit tenir dans la largeur --- */
+
+.v-top {
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.v-presence,
+.v-sync {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 1;
+}
+
+.v-menu-react {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem;
+  min-width: 0;
+  width: max-content;
+  max-width: min(78vw, 20rem);
+  padding: 0.35rem;
+}
+
+.v-btn-emoji {
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+@media (max-width: 720px) {
+  .v-controls {
+    padding: 1.2rem 0.35rem 0.45rem;
+  }
+
+  .v-top {
+    padding: 0.6rem 0.6rem 1.6rem;
+    gap: 0.4rem;
+  }
+
+  .v-top .v-title {
+    display: none;
+  }
+
+  .v-presence {
+    font-size: 0.72rem;
+    padding: 0.3rem 0.6rem;
+    margin-right: auto;
+    max-width: 70%;
+    white-space: nowrap;
+  }
+
+  .v-btn {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+  }
+
+  .v-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .v-btn-main svg {
+    width: 24px;
+    height: 24px;
+  }
+
+  .v-time {
+    padding: 0 0.25rem;
+    font-size: 0.74rem;
+  }
+
+  .v-scrub {
+    padding: 0.55rem 0.15rem;
+  }
+
+  .v-menu {
+    min-width: 168px;
+    max-width: min(80vw, 16rem);
+  }
+}
+
+@media (max-width: 430px) {
+  .v-btn {
+    width: 36px;
+    height: 36px;
+  }
+
+  .v-time-total,
+  .v-time-sep {
+    display: none;
+  }
 }

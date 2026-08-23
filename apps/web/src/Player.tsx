@@ -89,6 +89,10 @@ function writePreferredSubLang(lang: string) {
 /** Choisit la piste correspondant a la langue preferee, sinon rien. */
 function pickTrack(movie: Movie, lang: string): string {
   if (lang === "off") return "off";
+  if (lang.startsWith("id:")) {
+    const id = lang.slice(3);
+    return movie.subtitles.some((s) => s.id === id) ? id : "off";
+  }
   const hit = movie.subtitles.find(
     (s) => s.lang.toLowerCase() === lang.toLowerCase(),
   );
@@ -135,12 +139,16 @@ export function Player({ movie, sync, username, startAt }: Props) {
   const [levels, setLevels] = useState<QualityLevel[]>([]);
   const [levelId, setLevelId] = useState(-1);
   const [paused, setPaused] = useState(true);
+  const [controlsH, setControlsH] = useState(0);
   const [countdownLeft, setCountdownLeft] = useState<number | null>(null);
   const [cues, setCues] = useState<string[]>([]);
   const [cueScale, setCueScale] = useState(() => readCueScale());
   const [cueBox, setCueBox] = useState(() => readCueBox());
   const [subOffset, setSubOffset] = useState(0);
   const appliedOffset = useRef<Record<string, number>>({});
+  /** Decalage VOULU par piste. Doit rester lisible par le poll, sinon celui-ci
+   *  rejoue l'ancienne valeur et annule le reglage en moins d'une seconde. */
+  const desiredOffset = useRef<Record<string, number>>({});
   const [readySent, setReadySent] = useState(false);
 
   // Source figee a l'ouverture : si l'encodage HLS se termine pendant la
@@ -181,6 +189,8 @@ export function Player({ movie, sync, username, startAt }: Props) {
     setBlocked(false);
     setReadySent(false);
     setCountdownLeft(null);
+    appliedOffset.current = {};
+    desiredOffset.current = {};
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [movie.id]);
 
@@ -270,10 +280,13 @@ export function Player({ movie, sync, username, startAt }: Props) {
     if (!track) return;
     track.mode = "hidden";
 
-    const wanted = readOffset(trackId);
-    setSubOffset(wanted);
+    if (desiredOffset.current[trackId] == null) {
+      desiredOffset.current[trackId] = readOffset(trackId);
+    }
+    setSubOffset(desiredOffset.current[trackId]);
 
     const sync = () => {
+      const wanted = desiredOffset.current[trackId] ?? 0;
       const applied = appliedOffset.current[trackId] ?? 0;
       if (track.cues && track.cues.length > 0 && applied !== wanted) {
         shiftCues(track, wanted - applied);
@@ -304,11 +317,15 @@ export function Player({ movie, sync, username, startAt }: Props) {
       const video = videoRef.current;
       if (!video || trackId === "off") return;
       const next = Math.round((subOffset + delta) * 10) / 10;
+      desiredOffset.current[trackId] = next;
       const el = video.querySelector(
         `track[data-id="${CSS.escape(trackId)}"]`,
       ) as HTMLTrackElement | null;
+      // Cues deja chargees : on decale tout de suite. Sinon le poll s'en
+      // chargera des qu'elles arrivent, en lisant desiredOffset.
       if (el?.track?.cues?.length) {
-        shiftCues(el.track, delta);
+        const applied = appliedOffset.current[trackId] ?? 0;
+        shiftCues(el.track, next - applied);
         appliedOffset.current[trackId] = next;
       }
       setSubOffset(next);
@@ -333,10 +350,15 @@ export function Player({ movie, sync, username, startAt }: Props) {
   const chooseTrack = useCallback(
     (id: string) => {
       setTrackId(id);
+      const lang = movie.subtitles.find((s) => s.id === id)?.lang;
+      // « und » ne designe rien : deux pistes sans langue seraient
+      // interchangeables. On memorise alors la piste elle-meme.
       const chosen =
         id === "off"
           ? "off"
-          : (movie.subtitles.find((s) => s.id === id)?.lang ?? "off");
+          : !lang || lang === "und"
+            ? `id:${id}`
+            : lang;
       setPrefLang(chosen);
       writePreferredSubLang(chosen);
     },
@@ -825,6 +847,11 @@ export function Player({ movie, sync, username, startAt }: Props) {
         className="player-wrap"
         ref={wrapRef}
         data-ui={uiVisible ? "on" : "off"}
+        style={
+          controlsH
+            ? ({ ["--controls-h" as string]: `${controlsH}px` } as React.CSSProperties)
+            : undefined
+        }
         data-fs={fullscreen ? "real" : pseudoFs ? "pseudo" : "off"}
         onPointerMove={bumpUi}
         onPointerDown={bumpUi}
@@ -871,11 +898,18 @@ export function Player({ movie, sync, username, startAt }: Props) {
             });
           }}
           onSeeked={() => {
+            // L'ordre compte : mesurer l'ecart AVANT de deplacer l'ancre.
+            // Poser l'ancre d'abord rendait `expected` egal a la position
+            // courante, le garde sortait toujours, et plus aucun seek local
+            // n'etait transmis au serveur.
+            const expectedBefore = expectedNow();
             if (!applyingRef.current) anchorLocal();
             emit(() => {
               const v = videoRef.current!;
-              const expected = expectedNow();
-              if (expected != null && Math.abs(v.currentTime - expected) < 1.2) {
+              if (
+                expectedBefore != null &&
+                Math.abs(v.currentTime - expectedBefore) < 1.2
+              ) {
                 return;
               }
               v.playbackRate = 1;
@@ -1018,6 +1052,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
 
         <PlayerControls
           video={videoEl}
+          onHeight={setControlsH}
           fallbackDuration={movie.duration ?? undefined}
           visible={uiVisible}
           onActivity={bumpUi}
@@ -1095,10 +1130,11 @@ export function Player({ movie, sync, username, startAt }: Props) {
       </div>
 
       <div className="player-tools">
-        <span className="sync-badge" data-state={driftState}>
-          {driftText}
-          {lastBy ? ` · ${t("lastBy")} : ${lastBy}` : ""}
-        </span>
+        {lastBy && (
+          <span className="sync-badge" data-state="idle">
+            {t("lastBy")} : {lastBy}
+          </span>
+        )}
         {upgradeAvailable && (
           <button
             type="button"

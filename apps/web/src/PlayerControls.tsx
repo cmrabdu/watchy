@@ -16,6 +16,8 @@ type Props = {
   fallbackDuration?: number;
   visible: boolean;
   onActivity: () => void;
+  /** Hauteur reelle de la barre, pour poser les sous-titres juste au-dessus. */
+  onHeight?: (px: number) => void;
   onTogglePlay: () => void;
   onSeekTo: (t: number) => void;
   fullscreen: boolean;
@@ -34,6 +36,23 @@ type Props = {
 };
 
 const VOLUME_KEY = "watchy.volume";
+
+function useMediaQuery(query: string): boolean {
+  const [match, setMatch] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(query).matches
+      : false,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia(query);
+    const on = () => setMatch(mq.matches);
+    on();
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, [query]);
+  return match;
+}
 
 export function formatClock(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
@@ -76,6 +95,7 @@ export function PlayerControls({
   fallbackDuration,
   visible,
   onActivity,
+  onHeight,
   onTogglePlay,
   onSeekTo,
   fullscreen,
@@ -100,8 +120,24 @@ export function PlayerControls({
   const [muted, setMuted] = useState(() => readVolume().muted);
   const [scrub, setScrub] = useState<number | null>(null);
   const [hover, setHover] = useState<{ x: number; time: number } | null>(null);
-  const [menu, setMenu] = useState<"none" | "subs" | "quality">("none");
+  const [menu, setMenu] = useState<"none" | "subs" | "quality" | "react">(
+    "none",
+  );
   const barRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Sur telephone la rangee ne tient pas : les reactions passent dans un
+  // menu, sinon les sous-titres et le plein ecran sortent de l'ecran.
+  const compact = useMediaQuery("(max-width: 720px)");
+
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el || !onHeight) return;
+    onHeight(el.offsetHeight);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => onHeight(el.offsetHeight));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [onHeight, compact]);
 
   // Etat lu depuis l'element video : les controles se rafraichissent seuls,
   // sans re-rendre tout le lecteur ni la page.
@@ -213,6 +249,8 @@ export function PlayerControls({
   return (
     <div
       className="v-controls"
+      ref={rootRef}
+      data-compact={compact ? "yes" : "no"}
       data-visible={visible ? "yes" : "no"}
       onPointerMove={onActivity}
       onPointerDown={onActivity}
@@ -311,22 +349,55 @@ export function PlayerControls({
           />
         </div>
 
-        <div className="v-reactions">
-          {reactions.map((emoji) => (
+        {compact ? (
+          <div className="v-menu-holder">
             <button
-              key={emoji}
               type="button"
-              className="v-react"
-              onClick={() => {
-                onReact(emoji);
-                onActivity();
-              }}
-              aria-label={t("sendReaction", { emoji })}
+              className="v-btn v-btn-emoji"
+              onClick={() => setMenu((m) => (m === "react" ? "none" : "react"))}
+              aria-label={t("reactions")}
+              aria-expanded={menu === "react"}
             >
-              {emoji}
+              {reactions[0]}
             </button>
-          ))}
-        </div>
+            {menu === "react" && (
+              <div className="v-menu v-menu-react" role="menu">
+                {reactions.map((emoji) => (
+                  <button
+                    key={emoji}
+                    type="button"
+                    className="v-react"
+                    onClick={() => {
+                      onReact(emoji);
+                      onActivity();
+                      closeMenus();
+                    }}
+                    aria-label={t("sendReaction", { emoji })}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="v-reactions">
+            {reactions.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                className="v-react"
+                onClick={() => {
+                  onReact(emoji);
+                  onActivity();
+                }}
+                aria-label={t("sendReaction", { emoji })}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="v-menu-holder">
           <button
