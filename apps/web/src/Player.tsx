@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Movie, SyncState } from "./api";
 import { streamUrl, subtitleUrl } from "./api";
 import { useI18n } from "./i18n";
+import { PlayerControls, persistVolume, type QualityLevel } from "./PlayerControls";
 import type { useSync } from "./useSync";
 
 type SyncApi = ReturnType<typeof useSync>;
@@ -22,12 +23,18 @@ const RATE_SLOW = 0.98;
 
 const REACTIONS = ["❤️", "😂", "👀", "🔥", "👏", "😱"] as const;
 const SUB_LANG_KEY = "watchy.subtitleLang";
+const UI_IDLE_MS = 3200;
+
+type HlsLevel = { height?: number; bitrate?: number; name?: string };
 
 type HlsLike = {
   destroy: () => void;
   loadSource: (src: string) => void;
   attachMedia: (video: HTMLMediaElement) => void;
   on: (event: string, cb: (...args: unknown[]) => void) => void;
+  levels: HlsLevel[];
+  currentLevel: number;
+  autoLevelEnabled?: boolean;
 };
 
 type DriftInfo = { drift: number; state: "synced" | "catching" | "off" };
@@ -74,9 +81,18 @@ function pickTrack(movie: Movie, lang: string): string {
   return hit ? hit.id : "off";
 }
 
+function levelLabel(l: HlsLevel): string {
+  if (l.height) return `${l.height}p`;
+  if (l.name) return l.name;
+  if (l.bitrate) return `${Math.round(l.bitrate / 1000)} kb/s`;
+  return "?";
+}
+
 export function Player({ movie, sync, username, startAt }: Props) {
   const { t, lang } = useI18n();
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<HlsLike | null>(null);
   const applyingRef = useRef(false);
   const applyGen = useRef(0);
@@ -90,6 +106,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
     at: number;
   } | null>(null);
   const correctingRef = useRef(false);
+  const idleTimer = useRef<number | undefined>(undefined);
 
   const [prefLang, setPrefLang] = useState<string>(() => readPreferredSubLang());
   const [trackId, setTrackId] = useState<string>(() =>
@@ -98,6 +115,12 @@ export function Player({ movie, sync, username, startAt }: Props) {
   const [readyHint, setReadyHint] = useState<string | null>(null);
   const [drift, setDrift] = useState<DriftInfo | null>(null);
   const [blocked, setBlocked] = useState(false);
+  const [uiVisible, setUiVisible] = useState(true);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [pseudoFs, setPseudoFs] = useState(false);
+  const [levels, setLevels] = useState<QualityLevel[]>([]);
+  const [levelId, setLevelId] = useState(-1);
+  const [paused, setPaused] = useState(true);
 
   // Source figee a l'ouverture : si l'encodage HLS se termine pendant la
   // seance, on ne detruit pas le lecteur sous leurs pieds.
@@ -119,17 +142,17 @@ export function Player({ movie, sync, username, startAt }: Props) {
 
   const lastBy = sync.state?.updatedBy;
 
-  const peerStalled = sync.peers.find(
-    (p) =>
-      p.name.toLowerCase() !== username.toLowerCase() &&
-      p.stalled &&
-      p.watching === movie.id,
+  const others = sync.peers.filter(
+    (p) => p.name.toLowerCase() !== username.toLowerCase(),
   );
+  const peerStalled = others.find((p) => p.stalled && p.watching === movie.id);
+  const peerAway = others.find((p) => p.away);
+  const peerHere = others.find((p) => p.watching === movie.id);
 
   useEffect(() => {
-    const lang = readPreferredSubLang();
-    setPrefLang(lang);
-    setTrackId(pickTrack(movie, lang));
+    const pref = readPreferredSubLang();
+    setPrefLang(pref);
+    setTrackId(pickTrack(movie, pref));
     resumedRef.current = false;
     anchorRef.current = null;
     appliedRef.current = null;
@@ -146,6 +169,8 @@ export function Player({ movie, sync, username, startAt }: Props) {
     let destroyed = false;
     hlsRef.current?.destroy();
     hlsRef.current = null;
+    setLevels([]);
+    setLevelId(-1);
 
     const setup = async () => {
       if (pinned.hls) {
@@ -164,6 +189,22 @@ export function Player({ movie, sync, username, startAt }: Props) {
             maxBufferLength: 90,
             backBufferLength: 60,
           }) as unknown as HlsLike;
+          const publish = (activeIdx: number) => {
+            setLevels(
+              instance.levels.map((l, i) => ({
+                id: i,
+                label: levelLabel(l),
+                active: i === activeIdx,
+              })),
+            );
+          };
+          instance.on("hlsManifestParsed", () => {
+            publish(instance.currentLevel);
+          });
+          instance.on("hlsLevelSwitched", (...args: unknown[]) => {
+            const data = args[1] as { level?: number } | undefined;
+            publish(data?.level ?? instance.currentLevel);
+          });
           instance.loadSource(src);
           instance.attachMedia(video);
           hlsRef.current = instance;
@@ -202,15 +243,21 @@ export function Player({ movie, sync, username, startAt }: Props) {
   const chooseTrack = useCallback(
     (id: string) => {
       setTrackId(id);
-      const lang =
+      const chosen =
         id === "off"
           ? "off"
           : (movie.subtitles.find((s) => s.id === id)?.lang ?? "off");
-      setPrefLang(lang);
-      writePreferredSubLang(lang);
+      setPrefLang(chosen);
+      writePreferredSubLang(chosen);
     },
     [movie.subtitles],
   );
+
+  const chooseLevel = useCallback((id: number) => {
+    setLevelId(id);
+    const hls = hlsRef.current;
+    if (hls) hls.currentLevel = id;
+  }, []);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -437,16 +484,199 @@ export function Player({ movie, sync, username, startAt }: Props) {
     fn();
   };
 
+  /* ----- Interface : visibilite, plein ecran, clavier ----- */
+
+  const bumpUi = useCallback(() => {
+    setUiVisible(true);
+    window.clearTimeout(idleTimer.current);
+    const video = videoRef.current;
+    if (video && !video.paused) {
+      idleTimer.current = window.setTimeout(
+        () => setUiVisible(false),
+        UI_IDLE_MS,
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    if (paused) {
+      window.clearTimeout(idleTimer.current);
+      setUiVisible(true);
+    } else {
+      bumpUi();
+    }
+  }, [paused, bumpUi]);
+
+  useEffect(() => () => window.clearTimeout(idleTimer.current), []);
+
+  const togglePlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    bumpUi();
+    if (video.paused) void startPlayback();
+    else video.pause();
+  }, [bumpUi, startPlayback]);
+
+  const seekTo = useCallback(
+    (time: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      bumpUi();
+      video.playbackRate = 1;
+      correctingRef.current = false;
+      video.currentTime = clampTime(video, time);
+    },
+    [bumpUi],
+  );
+
+  const toggleFullscreen = useCallback(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    bumpUi();
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => undefined);
+      return;
+    }
+    if (pseudoFs) {
+      setPseudoFs(false);
+      return;
+    }
+    if (typeof el.requestFullscreen === "function") {
+      el.requestFullscreen({ navigationUI: "hide" }).catch(() => {
+        // iPhone : pas de plein ecran sur un div. On simule, sinon la
+        // surimpression (reactions, presence) disparaitrait justement au
+        // moment ou elle sert.
+        setPseudoFs(true);
+      });
+      return;
+    }
+    setPseudoFs(true);
+  }, [bumpUi, pseudoFs]);
+
+  useEffect(() => {
+    const onChange = () =>
+      setFullscreen(document.fullscreenElement === wrapRef.current);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const video = videoRef.current;
+      if (!video) return;
+      switch (e.key) {
+        case " ":
+        case "k":
+          e.preventDefault();
+          togglePlay();
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          seekTo(video.currentTime - (e.shiftKey ? 60 : 10));
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          seekTo(video.currentTime + (e.shiftKey ? 60 : 10));
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          video.volume = Math.min(1, video.volume + 0.05);
+          video.muted = false;
+          persistVolume(video.volume, false);
+          bumpUi();
+          break;
+        case "ArrowDown":
+          e.preventDefault();
+          video.volume = Math.max(0, video.volume - 0.05);
+          persistVolume(video.volume, video.muted);
+          bumpUi();
+          break;
+        case "f":
+          e.preventDefault();
+          toggleFullscreen();
+          break;
+        case "m":
+          e.preventDefault();
+          video.muted = !video.muted;
+          persistVolume(video.volume, video.muted);
+          bumpUi();
+          break;
+        default:
+          break;
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [togglePlay, seekTo, toggleFullscreen, bumpUi]);
+
+  const driftState =
+    drift == null
+      ? "idle"
+      : drift.state === "synced"
+        ? "synced"
+        : drift.state === "catching"
+          ? "resync"
+          : "offline";
+
+  const driftText =
+    drift == null
+      ? t("sharedControl")
+      : drift.state === "synced"
+        ? t("driftSynced", { d: fmtSeconds(drift.drift, lang) })
+        : drift.state === "catching"
+          ? t("driftCatching", { d: fmtSeconds(drift.drift, lang) })
+          : t("driftOff", { d: fmtSeconds(drift.drift, lang) });
+
+  const presenceText = peerStalled
+    ? t("peerLoading", { name: peerStalled.name })
+    : peerAway
+      ? `${t("peerAway", { name: peerAway.name })}${
+          peerAway.awayReason ? ` — ${peerAway.awayReason}` : ""
+        }`
+      : peerHere
+        ? t("peerWatchingWith", { name: peerHere.name })
+        : others.length
+          ? t("peerInCatalog", { name: others[0].name })
+          : t("nobodyElse");
+
   return (
     <div className="player-stack">
-      <div className="player-wrap">
+      <div
+        className="player-wrap"
+        ref={wrapRef}
+        data-ui={uiVisible ? "on" : "off"}
+        data-fs={fullscreen ? "real" : pseudoFs ? "pseudo" : "off"}
+        onPointerMove={bumpUi}
+        onPointerDown={bumpUi}
+        onTouchStart={bumpUi}
+      >
         <video
-          ref={videoRef}
-          controls
+          ref={(el) => {
+            videoRef.current = el;
+            setVideoEl(el);
+          }}
           playsInline
           preload="auto"
           crossOrigin="use-credentials"
+          onClick={() => {
+            // Sur telephone, la premiere touche revele les commandes ;
+            // la seconde joue ou met en pause.
+            if (!uiVisible) bumpUi();
+            else togglePlay();
+          }}
+          onDoubleClick={toggleFullscreen}
           onPlay={() => {
+            setPaused(false);
             setBlocked(false);
             emit(() => {
               const v = videoRef.current!;
@@ -454,6 +684,7 @@ export function Player({ movie, sync, username, startAt }: Props) {
             });
           }}
           onPause={() => {
+            setPaused(true);
             // Verrouillage d'ecran ou appel entrant : le navigateur met en
             // pause. Ne pas propager, sinon l'autre est arrete sans raison.
             if (document.visibilityState === "hidden") return;
@@ -511,49 +742,70 @@ export function Player({ movie, sync, username, startAt }: Props) {
             );
           })}
         </div>
-      </div>
 
-      {blocked && (
-        <div className="play-blocked">
-          <span>{t("playBlocked")}</span>
+        <div className="v-top" data-visible={uiVisible ? "yes" : "no"}>
+          <span className="v-title">{movie.title}</span>
+          <span className="v-presence" data-state={peerStalled ? "wait" : "ok"}>
+            <span className="dot" />
+            {presenceText}
+          </span>
+          <span className="v-sync" data-state={driftState}>
+            {driftText}
+          </span>
+        </div>
+
+        {readyHint && <div className="v-toast">{readyHint}</div>}
+
+        {blocked && (
+          <div className="v-blocked">
+            <p>{t("playBlocked")}</p>
+            <button
+              type="button"
+              className="primary-btn"
+              onClick={() => void startPlayback()}
+            >
+              {t("tapToJoin")}
+            </button>
+          </div>
+        )}
+
+        {paused && !blocked && (
           <button
             type="button"
-            className="primary-btn"
-            onClick={() => void startPlayback()}
+            className="v-bigplay"
+            onClick={togglePlay}
+            aria-label={t("play")}
           >
-            {t("tapToJoin")}
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 5.5v13l11-6.5z" fill="currentColor" />
+            </svg>
           </button>
-        </div>
-      )}
+        )}
+
+        <PlayerControls
+          video={videoEl}
+          visible={uiVisible}
+          onActivity={bumpUi}
+          onTogglePlay={togglePlay}
+          onSeekTo={seekTo}
+          fullscreen={fullscreen || pseudoFs}
+          onToggleFullscreen={toggleFullscreen}
+          subtitles={movie.subtitles.map((s) => ({ id: s.id, label: s.label }))}
+          trackId={trackId}
+          onTrack={chooseTrack}
+          levels={levels}
+          levelId={levelId}
+          onLevel={chooseLevel}
+          reactions={REACTIONS}
+          onReact={(emoji) => sync.react(emoji)}
+        />
+      </div>
 
       <div className="player-tools">
-        <span
-          className="sync-badge"
-          data-state={
-            drift == null
-              ? "idle"
-              : drift.state === "synced"
-                ? "synced"
-                : drift.state === "catching"
-                  ? "resync"
-                  : "offline"
-          }
-        >
-          {drift == null
-            ? t("sharedControl")
-            : drift.state === "synced"
-              ? t("driftSynced", { d: fmtSeconds(drift.drift, lang) })
-              : drift.state === "catching"
-                ? t("driftCatching", { d: fmtSeconds(drift.drift, lang) })
-                : t("driftOff", { d: fmtSeconds(drift.drift, lang) })}
+        <span className="sync-badge" data-state={driftState}>
+          {driftText}
           {lastBy ? ` · ${t("lastBy")} : ${lastBy}` : ""}
         </span>
-        {peerStalled && (
-          <span className="sub-hint peer-stalled">
-            {t("peerLoading", { name: peerStalled.name })}
-          </span>
-        )}
-        {readyHint && <span className="sub-hint">{readyHint}</span>}
         {upgradeAvailable && (
           <button
             type="button"
@@ -570,20 +822,6 @@ export function Player({ movie, sync, username, startAt }: Props) {
             {t("sourceUpgraded")}
           </button>
         )}
-
-        <div className="reaction-bar">
-          {REACTIONS.map((emoji) => (
-            <button
-              key={emoji}
-              type="button"
-              className="reaction-btn"
-              onClick={() => sync.react(emoji)}
-            >
-              {emoji}
-            </button>
-          ))}
-        </div>
-
         <button
           type="button"
           className="ghost-btn"
@@ -598,20 +836,10 @@ export function Player({ movie, sync, username, startAt }: Props) {
         >
           {t("refreshAll")}
         </button>
-
-        <label className="sub-select">
-          <span>{t("subtitles")}</span>
-          <select value={trackId} onChange={(e) => chooseTrack(e.target.value)}>
-            <option value="off">{t("subsOff")}</option>
-            {movie.subtitles.map((tr) => (
-              <option key={tr.id} value={tr.id}>
-                {tr.label}
-              </option>
-            ))}
-          </select>
-        </label>
         {prefLang !== "off" && trackId === "off" && (
-          <span className="sub-hint">{t("subPrefMissing", { lang: prefLang })}</span>
+          <span className="sub-hint">
+            {t("subPrefMissing", { lang: prefLang })}
+          </span>
         )}
       </div>
     </div>
