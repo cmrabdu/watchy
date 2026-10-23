@@ -236,6 +236,58 @@ export function setEveningNote(id: string, note: string) {
   });
 }
 
+
+/* --- OpenSubtitles (serveur : /api/opensubtitles/*) ------------------------
+ * Ouvert aux deux roles : les MKV occidentaux ne portent presque jamais
+ * d'arabe, et c'est elle qui en a besoin.
+ */
+
+export type SubtitleCandidate = {
+  fileId: number;
+  lang: string;
+  release: string;
+  title: string;
+  downloads: number;
+  rating: number;
+  hearingImpaired: boolean;
+  fromTrusted: boolean;
+  /** vrai quand le fichier correspond a CE rip, par empreinte et non par titre */
+  hashMatch: boolean;
+};
+
+export function openSubtitlesStatus() {
+  return request<{ configured: boolean }>("/api/opensubtitles/status");
+}
+
+export function searchOpenSubtitles(movieId: string, langs: string[]) {
+  const params = new URLSearchParams({ movieId });
+  if (langs.length) params.set("langs", langs.join(","));
+  return request<{
+    hash: string | null;
+    matchedBy: "hash" | "title";
+    results: SubtitleCandidate[];
+  }>(`/api/opensubtitles/search?${params}`);
+}
+
+export function downloadOpenSubtitle(input: {
+  movieId: string;
+  fileId: number;
+  lang: string;
+}) {
+  return request<{
+    ok: boolean;
+    filename: string;
+    lang: string;
+    bytes: number;
+    replaced: boolean;
+    remaining: number | null;
+    subtitles: SubtitleTrack[];
+  }>("/api/opensubtitles/download", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export function streamUrl(movie: Movie): string {
   if (movie.hasHls && movie.hlsPath) {
     return `/api/hls/${movie.hlsPath}`;
