@@ -18,8 +18,9 @@ import {
   verifySession,
 } from "./auth.js";
 import { config, type Role } from "./config.js";
-import { removeEntry, upsertEntry } from "./catalog.js";
+import { getEntry, removeEntry, upsertEntry } from "./catalog.js";
 import {
+  ServerEncodeRefused,
   applyTmdbMatch,
   getHlsJob,
   indexMedia,
@@ -30,9 +31,28 @@ import {
   openRangeStream,
   resolveMediaRelative,
   resolveMoviePath,
+  resolveMovieRef,
 } from "./media.js";
-import { setProgress } from "./progress.js";
-import { resolveSubtitlePath, srtToVtt } from "./subtitles.js";
+import { getProgress, setProgress } from "./progress.js";
+import {
+  convertToSrtIfNeeded,
+  listSubtitles,
+  resolveSubtitlePath,
+  srtToVtt,
+} from "./subtitles.js";
+import { listEvenings, recordSession, setEveningNote } from "./history.js";
+import {
+  OpenSubtitlesDisabled,
+  downloadSubtitle,
+  hasOpenSubtitles,
+  movieHash,
+  searchSubtitles,
+} from "./opensubtitles.js";
+import {
+  addToWatchlist,
+  listWatchlist,
+  removeFromWatchlist,
+} from "./watchlist.js";
 import { room, type ClientMessage, type ServerMessage } from "./sync.js";
 import {
   getTmdbMovie,
@@ -40,7 +60,14 @@ import {
   saveUploadedPoster,
   searchTmdbMovies,
 } from "./tmdb.js";
-import { sanitizeUploadName, saveUploadStream } from "./upload.js";
+import {
+  abortUpload,
+  appendUploadChunk,
+  isVideoName,
+  sanitizeUploadName,
+  saveUploadStream,
+  uploadStatus,
+} from "./upload.js";
 
 type Vars = { username: string; role: Role };
 
@@ -97,8 +124,11 @@ const requireAdmin = async (
   await next();
 };
 
-app.get("/api/health", (c) =>
-  c.json({ ok: true, peers: room.peerCount(), peersList: room.peerNames() }),
+// Public probe: no peer identities here — it is reachable without a cookie.
+app.get("/api/health", (c) => c.json({ ok: true }));
+
+app.get("/api/presence", requireAuth, (c) =>
+  c.json({ peerCount: room.peerCount(), peers: room.peerInfos() }),
 );
 
 app.get("/api/me", (c) => {
@@ -137,7 +167,10 @@ app.get("/api/movies", requireAuth, async (c) => {
   const movies = await listMovies();
   return c.json({
     movies,
+    // `peers` stays string[] for REST compatibility; `peerInfos` matches the
+    // WebSocket contract (PeerInfo[]) and is the one to trust for presence.
     peers: room.peerNames(),
+    peerInfos: room.peerInfos(),
     peerCount: room.peerCount(),
     sync: room.getState(),
   });
@@ -180,23 +213,144 @@ app.get("/api/subtitles/:trackId", requireAuth, async (c) => {
   });
 });
 
-app.put("/api/upload", requireAuth, requireAdmin, async (c) => {
+/**
+ * Resumable upload — ask where to restart.
+ *   HEAD /api/upload?name=<file>  ->  Upload-Offset: <bytes already stored>
+ *   GET  /api/upload?name=<file>  ->  the same, as JSON
+ * Registered as GET on purpose: this Hono version routes HEAD to the GET
+ * handler and drops the body, and app.on("HEAD", ...) never matches.
+ */
+app.get("/api/upload", requireAuth, async (c) => {
+  const name = sanitizeUploadName(c.req.query("name") ?? "");
+  if (!name) return c.json({ error: "Nom de fichier invalide" }, 400);
+  if (isVideoName(name) && c.get("role") !== "admin") {
+    return c.json({ error: "Admin uniquement" }, 403);
+  }
+  const status = await uploadStatus(name);
+  return c.json(
+    {
+      filename: name,
+      offset: status.offset,
+      completed: status.completed,
+      updatedAt: status.updatedAt,
+    },
+    200,
+    {
+      "Upload-Offset": String(status.offset),
+      "Upload-Complete": status.completed ? "true" : "false",
+      "Accept-Ranges": "bytes",
+      ...(status.updatedAt
+        ? { "Last-Modified": new Date(status.updatedAt).toUTCString() }
+        : {}),
+    },
+  );
+});
+
+/** Give up on a partial upload and free its bytes. */
+app.delete("/api/upload", requireAuth, async (c) => {
+  const name = sanitizeUploadName(c.req.query("name") ?? "");
+  if (!name) return c.json({ error: "Nom de fichier invalide" }, 400);
+  if (isVideoName(name) && c.get("role") !== "admin") {
+    return c.json({ error: "Admin uniquement" }, 403);
+  }
+  try {
+    const removed = await abortUpload(name);
+    return c.json({ ok: true, removed });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : "Abort failed" },
+      409,
+    );
+  }
+});
+
+app.put("/api/upload", requireAuth, async (c) => {
   const name = sanitizeUploadName(c.req.query("name") ?? "");
   if (!name) {
     return c.json(
-      { error: "Nom de fichier invalide (mp4/webm/mkv/m4v/vtt/srt)" },
+      { error: "Nom de fichier invalide (mp4/webm/mkv/m4v/vtt/srt/ass/ssa)" },
       400,
     );
   }
+  // Subtitles are open to both roles: an 80 kB .srt was the most unfair thing
+  // in the product to refuse. Video stays admin — it is what fills the disk.
+  if (isVideoName(name) && c.get("role") !== "admin") {
+    return c.json(
+      { error: "Les fichiers vidéo sont réservés à l'administrateur" },
+      403,
+    );
+  }
+  // Video: never clobber — a same-named upload used to silently destroy a
+  // file that might be playing right now. Subtitles: replacing is the point.
+  const policy = isVideoName(name) ? "suffix" : "overwrite";
+  const contentRange = c.req.header("content-range");
+
+  if (contentRange) {
+    const m = /^bytes\s+(\d+)-(\d+)\/(\d+)$/i.exec(contentRange.trim());
+    if (!m) {
+      return c.json(
+        { error: "Content-Range attendu: bytes <début>-<fin>/<total>" },
+        400,
+      );
+    }
+    const [start, end, total] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    try {
+      const res = await appendUploadChunk(
+        name,
+        c.req.raw.body,
+        start,
+        end,
+        total,
+        policy,
+      );
+      if (!res.complete) {
+        return c.json(
+          { ok: true, complete: false, filename: name, offset: res.offset },
+          200,
+          { "Upload-Offset": String(res.offset) },
+        );
+      }
+      if (isVideoName(res.filename)) {
+        void indexMedia(res.filename).catch((err) =>
+          console.error("index failed", res.filename, err),
+        );
+      }
+      const finalName = isVideoName(res.filename)
+        ? res.filename
+        : await convertToSrtIfNeeded(res.filename);
+      return c.json({
+        ok: true,
+        complete: true,
+        filename: finalName,
+        size: res.size,
+        replaced: res.replaced,
+      });
+    } catch (err) {
+      const offset = (err as { offset?: number }).offset;
+      const message = err instanceof Error ? err.message : "Upload failed";
+      if (typeof offset === "number") {
+        // Tell the truth about where we are instead of corrupting the file.
+        return c.json({ error: message, offset }, 409, {
+          "Upload-Offset": String(offset),
+        });
+      }
+      return c.json({ error: message }, 400);
+    }
+  }
+
   try {
-    const saved = await saveUploadStream(name, c.req.raw.body);
-    const isVideo = /\.(mp4|webm|mkv|m4v)$/i.test(saved.filename);
+    const saved = await saveUploadStream(name, c.req.raw.body, policy);
+    const isVideo = isVideoName(saved.filename);
     if (isVideo) {
       void indexMedia(saved.filename).catch((err) =>
         console.error("index failed", saved.filename, err),
       );
     }
-    return c.json({ ok: true, ...saved });
+    // .ass/.ssa become .srt: the browser cannot render SubStation Alpha.
+    const finalName = isVideo
+      ? saved.filename
+      : await convertToSrtIfNeeded(saved.filename);
+    return c.json({ ...saved, ok: true, filename: finalName });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Upload failed";
     return c.json({ error: message }, 400);
@@ -204,7 +358,7 @@ app.put("/api/upload", requireAuth, requireAdmin, async (c) => {
 });
 
 app.patch("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   const body = await c.req.json<{
     title?: string;
@@ -233,7 +387,7 @@ app.patch("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
 });
 
 app.post("/api/movies/:id/index", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   // Allow re-match even if previously manual: wipe lock for this scan
   await upsertEntry(resolved.filename, { metadataSource: null });
@@ -245,7 +399,8 @@ app.get("/api/tmdb/status", requireAuth, (c) =>
   c.json({ configured: hasTmdb() }),
 );
 
-app.get("/api/tmdb/search", requireAuth, requireAdmin, async (c) => {
+// Open to both roles: she must be able to look a film up to wish for it.
+app.get("/api/tmdb/search", requireAuth, async (c) => {
   if (!hasTmdb()) {
     return c.json({ error: "TMDB_API_KEY non configurée" }, 503);
   }
@@ -278,7 +433,7 @@ app.post("/api/movies/:id/tmdb", requireAuth, requireAdmin, async (c) => {
   if (!hasTmdb()) {
     return c.json({ error: "TMDB_API_KEY non configurée" }, 503);
   }
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   const body = await c.req.json<{ tmdbId?: number }>();
   const tmdbId = Number(body.tmdbId);
@@ -296,7 +451,7 @@ app.post("/api/movies/:id/tmdb", requireAuth, requireAdmin, async (c) => {
 });
 
 app.put("/api/movies/:id/poster", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
+  const resolved = resolveMovieRef(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
   const ct = c.req.header("content-type") || "";
   if (!ct.includes("image/")) {
@@ -314,10 +469,38 @@ app.put("/api/movies/:id/poster", requireAuth, requireAdmin, async (c) => {
   return c.json({ ok: true, poster });
 });
 
+/**
+ * Server-side encoding is a fallback, not the normal path. Encoding a ladder
+ * on 2 vCPU takes hours and competes with playback, so it must be asked for
+ * explicitly with {"force": true}. The normal path is:
+ *   scripts/transcode-hls.sh <film>   puis   scripts/publish-hls.sh <film>
+ */
 app.post("/api/movies/:id/prepare", requireAuth, requireAdmin, async (c) => {
   const resolved = resolveMoviePath(c.req.param("id"));
   if (!resolved) return c.json({ error: "Not found" }, 404);
-  prepareHls(resolved.filename);
+  const body = await c.req.json<{ force?: boolean; preset?: string; maxHeight?: number }>()
+    .catch(() => ({}) as { force?: boolean; preset?: string; maxHeight?: number });
+  try {
+    prepareHls(resolved.filename, {
+      allowServerEncode: body.force === true,
+      preset: body.preset,
+      maxHeight: body.maxHeight,
+    });
+  } catch (err) {
+    if (err instanceof ServerEncodeRefused) {
+      return c.json(
+        {
+          error: err.message,
+          upstream: {
+            encode: "scripts/transcode-hls.sh <fichier>",
+            publish: "scripts/publish-hls.sh <fichier>",
+          },
+        },
+        409,
+      );
+    }
+    throw err;
+  }
   return c.json({ ok: true, job: getHlsJob(resolved.filename) });
 });
 
@@ -341,13 +524,205 @@ app.get("/api/posters/:name", requireAuth, async (c) => {
   });
 });
 
-app.delete("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
-  const resolved = resolveMoviePath(c.req.param("id"));
-  if (!resolved) return c.json({ error: "Not found" }, 404);
-  await fsp.unlink(resolved.moviePath);
-  await removeEntry(resolved.filename);
+// --- Watchlist partagée -----------------------------------------------------
+// No video file needed: a wish is a TMDB title, who wanted it, and when.
+
+app.get("/api/watchlist", requireAuth, async (c) =>
+  c.json({ items: await listWatchlist() }),
+);
+
+app.post("/api/watchlist", requireAuth, async (c) => {
+  const body = await c.req.json<{
+    tmdbId?: number;
+    title?: string;
+    year?: string | null;
+    overview?: string;
+    posterUrl?: string | null;
+  }>();
+  const tmdbId = Number(body.tmdbId);
+  let title = String(body.title ?? "").trim();
+  let year = body.year ?? null;
+  let overview = String(body.overview ?? "");
+  let poster = body.posterUrl ?? null;
+
+  // Prefer canonical TMDB data when we have a key; fall back to what the
+  // client sends so the watchlist keeps working without TMDB_API_KEY.
+  if (tmdbId && hasTmdb()) {
+    try {
+      const hit = await getTmdbMovie(tmdbId);
+      title = hit.title;
+      year = hit.release_date?.slice(0, 4) ?? null;
+      overview = hit.overview ?? "";
+      poster = hit.poster_path
+        ? `https://image.tmdb.org/t/p/w342${hit.poster_path}`
+        : null;
+    } catch {
+      /* keep whatever the client provided */
+    }
+  }
+  if (!title) return c.json({ error: "Titre requis" }, 400);
+
+  const { item, already } = await addToWatchlist(
+    {
+      tmdbId: tmdbId || null,
+      title,
+      year,
+      overview,
+      posterUrl: poster,
+    },
+    c.get("username"),
+  );
+  return c.json({ ok: true, item, already });
+});
+
+app.delete("/api/watchlist/:id", requireAuth, async (c) => {
+  const ok = await removeFromWatchlist(c.req.param("id"), c.get("username"));
+  if (!ok) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
 });
+
+// --- Nos soirées ------------------------------------------------------------
+// Deliberately decoupled from the video files: deleting a film to free disk
+// space must not erase the evening they spent watching it.
+
+app.get("/api/history", requireAuth, async (c) =>
+  c.json({ evenings: await listEvenings() }),
+);
+
+app.patch("/api/history/:id", requireAuth, async (c) => {
+  const body = await c.req.json<{ note?: string }>();
+  const ok = await setEveningNote(c.req.param("id"), String(body.note ?? ""));
+  if (!ok) return c.json({ error: "Not found" }, 404);
+  return c.json({ ok: true });
+});
+
+// --- OpenSubtitles ----------------------------------------------------------
+// Namespaced away from /api/subtitles/:trackId on purpose, so "search" can
+// never be mistaken for a track id. Open to both roles: she is the one who
+// needs Arabic, and western MKVs almost never carry it.
+
+app.get("/api/opensubtitles/status", requireAuth, (c) =>
+  c.json({ configured: hasOpenSubtitles() }),
+);
+
+app.get("/api/opensubtitles/search", requireAuth, async (c) => {
+  if (!hasOpenSubtitles()) {
+    return c.json({ error: new OpenSubtitlesDisabled().message }, 503);
+  }
+  const ref = resolveMovieRef(c.req.query("movieId") ?? "");
+  if (!ref) return c.json({ error: "Not found" }, 404);
+  const languages = (c.req.query("langs") ?? "ar,fr,en")
+    .split(",")
+    .map((l) => l.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 8);
+
+  // Hash first: it matches this exact rip, so the timings already line up.
+  // A ladder-only film has no source bytes, so it falls back to the title.
+  let hash: string | undefined;
+  if (ref.moviePath) {
+    try {
+      hash = (await movieHash(ref.moviePath)).hash;
+    } catch {
+      hash = undefined;
+    }
+  }
+  const entry = await getEntry(ref.filename);
+  const query = hash ? undefined : entry.title || ref.stem;
+
+  try {
+    const results = await searchSubtitles({ hash, query, languages });
+    return c.json({
+      hash: hash ?? null,
+      matchedBy: hash ? "hash" : "title",
+      results: results.slice(0, 25),
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : "OpenSubtitles error" },
+      502,
+    );
+  }
+});
+
+app.post("/api/opensubtitles/download", requireAuth, async (c) => {
+  if (!hasOpenSubtitles()) {
+    return c.json({ error: new OpenSubtitlesDisabled().message }, 503);
+  }
+  const body = await c.req.json<{
+    movieId?: string;
+    fileId?: number;
+    lang?: string;
+  }>();
+  const ref = resolveMovieRef(body.movieId ?? "");
+  if (!ref) return c.json({ error: "Not found" }, 404);
+  const fileId = Number(body.fileId);
+  if (!fileId) return c.json({ error: "fileId requis" }, 400);
+
+  try {
+    const saved = await downloadSubtitle({
+      fileId,
+      stem: ref.stem,
+      lang: String(body.lang ?? "und"),
+    });
+    const tracks = await listSubtitles(ref.filename);
+    return c.json({ ok: true, ...saved, subtitles: tracks });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : "Téléchargement échoué" },
+      502,
+    );
+  }
+});
+
+app.delete("/api/movies/:id", requireAuth, requireAdmin, async (c) => {
+  const ref = resolveMovieRef(c.req.param("id"));
+  if (!ref) return c.json({ error: "Not found" }, 404);
+
+  // The .hls ladder is 2–4 GB and the extracted .srt sidecars pile up: deleting
+  // only the video left the disk full on a 40 GB VPS.
+  const removed: string[] = [];
+  let freed = await dirSize(ref.hlsDir);
+
+  const sidecars = await listSubtitles(ref.filename);
+  for (const track of sidecars) {
+    const full = path.join(config.mediaDir, track.filename);
+    const st = await fsp.stat(full).catch(() => null);
+    await fsp.unlink(full).catch(() => undefined);
+    if (st) freed += st.size;
+    removed.push(track.filename);
+  }
+
+  if (fs.existsSync(ref.hlsDir)) {
+    await fsp.rm(ref.hlsDir, { recursive: true, force: true }).catch(() => undefined);
+    removed.push(`${ref.stem}.hls/`);
+  }
+
+  if (ref.moviePath && fs.existsSync(ref.moviePath)) {
+    const st = await fsp.stat(ref.moviePath).catch(() => null);
+    await fsp.unlink(ref.moviePath);
+    if (st) freed += st.size;
+    removed.push(ref.filename);
+  }
+
+  await removeEntry(ref.filename);
+  return c.json({ ok: true, removed, freedBytes: freed });
+});
+
+async function dirSize(dir: string): Promise<number> {
+  if (!fs.existsSync(dir)) return 0;
+  let total = 0;
+  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) total += await dirSize(full);
+    else {
+      const st = await fsp.stat(full).catch(() => null);
+      if (st) total += st.size;
+    }
+  }
+  return total;
+}
 
 // Persist watch progress from sync controls (shared couple resume)
 room.setProgressHandler((movieId, mediaTime, by) => {
@@ -357,6 +732,17 @@ room.setProgressHandler((movieId, mediaTime, by) => {
   } catch {
     /* ignore bad id */
   }
+});
+
+// Reactions and time actually spent watching together become "Nos soirées"
+room.setSessionHandler((ev) => {
+  void recordSession(ev).catch((err) => console.error("history failed", err));
+});
+
+// Cold start / first open: resume where progress.json left off instead of 0:00
+room.setResumeHandler(async (movieId) => {
+  const prog = await getProgress(movieId).catch(() => null);
+  return prog?.mediaTime ?? null;
 });
 
 // Index existing library on boot (non-blocking)
@@ -403,7 +789,53 @@ const server = serve(
   },
 ) as HttpServer;
 
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",
+  // Refuse the upgrade *before* the handshake. Accepting it and checking the
+  // cookie afterwards let an unauthenticated client reach the frame parser,
+  // where a malformed frame raised an 'error' with no listener and killed the
+  // process (all in-memory sync state with it).
+  verifyClient: (info, done) => {
+    const session = readSessionFromCookieValue(
+      cookieFromHeader(info.req.headers.cookie, SESSION_COOKIE),
+    );
+    if (!session) {
+      done(false, 401, "Unauthorized");
+      return;
+    }
+    done(true);
+  },
+});
+
+// An 'error' with no listener on an EventEmitter is an uncaught exception.
+wss.on("error", (err) => console.error("wss error", err));
+
+/** Application-level keepalive: sleeping phones never send FIN. */
+const PING_MS = 30000;
+type Liveness = { alive: boolean; pingAt: number; peerId: string };
+const liveness = new Map<WebSocket, Liveness>();
+
+const pinger = setInterval(() => {
+  for (const socket of wss.clients) {
+    const st = liveness.get(socket);
+    if (!st) continue;
+    if (!st.alive) {
+      // Missed a full cycle: it is a ghost, not a viewer.
+      socket.terminate();
+      continue;
+    }
+    st.alive = false;
+    st.pingAt = Date.now();
+    try {
+      socket.ping();
+    } catch {
+      socket.terminate();
+    }
+  }
+}, PING_MS);
+pinger.unref?.();
+wss.on("close", () => clearInterval(pinger));
 
 wss.on("connection", (socket: WebSocket, req) => {
   const session = readSessionFromCookieValue(
@@ -411,17 +843,41 @@ wss.on("connection", (socket: WebSocket, req) => {
   );
   const peerId = nanoid();
 
+  // Never let a socket error escape: ws emits 'error' on malformed frames.
+  socket.on("error", () => {
+    try {
+      socket.terminate();
+    } catch {
+      /* already gone */
+    }
+  });
+
   if (!session) {
-    socket.send(JSON.stringify({ type: "error", message: "Unauthorized" } satisfies ServerMessage));
+    socket.send(
+      JSON.stringify({ type: "error", message: "Unauthorized" } satisfies ServerMessage),
+    );
     socket.close();
     return;
   }
 
   const send = (msg: ServerMessage) => {
     if (socket.readyState === socket.OPEN) {
-      socket.send(JSON.stringify(msg));
+      try {
+        socket.send(JSON.stringify(msg));
+      } catch {
+        /* peer went away mid-write */
+      }
     }
   };
+
+  liveness.set(socket, { alive: true, pingAt: Date.now(), peerId });
+  socket.on("pong", () => {
+    const st = liveness.get(socket);
+    if (!st) return;
+    st.alive = true;
+    // Round-trip time feeds latency compensation in the sync room.
+    room.setLatency(peerId, Date.now() - st.pingAt);
+  });
 
   room.connect(peerId, session.u, send);
 
@@ -435,6 +891,7 @@ wss.on("connection", (socket: WebSocket, req) => {
   });
 
   socket.on("close", () => {
+    liveness.delete(socket);
     room.disconnect(peerId);
   });
 });

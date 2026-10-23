@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+} from "react";
 import {
   deleteMovie,
   fetchMovies,
@@ -14,19 +20,59 @@ import { LangToggle, SiteCredit, useI18n } from "./i18n";
 import { Player } from "./Player";
 import { PosterImage } from "./PosterImage";
 import { UploadDropzone } from "./UploadDropzone";
-import { useSync } from "./useSync";
+import { Nights } from "./Nights";
+import { useSync, type PeerInfo } from "./useSync";
+import { Watchlist } from "./Watchlist";
+
+/** Routage minimal par hash, pour survivre a un F5. */
+type Route =
+  | { name: "catalog" }
+  | { name: "movie"; id: string }
+  | { name: "watchlist" }
+  | { name: "nights" };
+
+function parseRoute(): Route {
+  const h = location.hash;
+  const m = /^#\/movie\/(.+)$/.exec(h);
+  if (m) return { name: "movie", id: decodeURIComponent(m[1]) };
+  if (h === "#/watchlist") return { name: "watchlist" };
+  if (h === "#/nights") return { name: "nights" };
+  return { name: "catalog" };
+}
+
+function goToMovie(id: string) {
+  location.hash = `#/movie/${encodeURIComponent(id)}`;
+}
+
+function goToCatalog() {
+  location.hash = "#/";
+}
 
 export function App() {
   const { t } = useI18n();
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [movies, setMovies] = useState<Movie[]>([]);
-  const [peers, setPeers] = useState<string[]>([]);
-  const [active, setActive] = useState<Movie | null>(null);
+  const [restPeers, setRestPeers] = useState<string[]>([]);
+  const [route, setRoute] = useState<Route>(() => parseRoute());
   const [resumeAt, setResumeAt] = useState<number | null>(null);
   const [editing, setEditing] = useState<Movie | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [roomBlurbOpen, setRoomBlurbOpen] = useState(false);
+
+  useEffect(() => {
+    const onHash = () => setRoute(parseRoute());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const active = useMemo(
+    () =>
+      route.name === "movie"
+        ? (movies.find((m) => m.id === route.id) ?? null)
+        : null,
+    [route, movies],
+  );
 
   const sync = useSync(user?.username ?? null, active?.id ?? null);
   const isAdmin = user?.role === "admin";
@@ -35,29 +81,17 @@ export function App() {
   const refreshMovies = useCallback(() => {
     return fetchMovies()
       .then((r) => {
-        setMovies(r.movies);
-        setPeers(r.peers);
-        setActive((curr) => {
-          if (!curr) return null;
-          const next = r.movies.find((m) => m.id === curr.id);
-          if (!next) return null;
-          const sameStream =
-            next.hasHls === curr.hasHls &&
-            next.hlsPath === curr.hlsPath &&
-            next.filename === curr.filename;
-          const sameSubs =
-            next.subtitles.length === curr.subtitles.length &&
-            next.subtitles.every((s, i) => s.id === curr.subtitles[i]?.id);
-          if (
-            sameStream &&
-            sameSubs &&
-            next.title === curr.title &&
-            next.description === curr.description
-          ) {
-            return curr;
-          }
-          return next;
-        });
+        // Le sondage ne doit pas provoquer de rendu s'il n'apporte rien :
+        // chaque rendu de App traverse le lecteur pendant le film.
+        setMovies((prev) =>
+          JSON.stringify(prev) === JSON.stringify(r.movies) ? prev : r.movies,
+        );
+        const names = (r.peers as (string | { name?: string })[]).map((p) =>
+          typeof p === "string" ? p : (p?.name ?? ""),
+        );
+        setRestPeers((prev) =>
+          prev.join("|") === names.join("|") ? prev : names,
+        );
       })
       .catch((e: Error) => setError(e.message));
   }, []);
@@ -77,21 +111,45 @@ export function App() {
       if (cancelled) return;
     };
     load();
-    const id = window.setInterval(load, 8000);
+    const id = window.setInterval(load, 30000);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
   }, [user, refreshMovies]);
 
-  useEffect(() => {
-    if (sync.peers.length) setPeers(sync.peers);
-  }, [sync.peers]);
+  const peers: PeerInfo[] = useMemo(() => {
+    if (sync.peers.length) return sync.peers;
+    return restPeers.map((name) => ({
+      name,
+      watching: null,
+      stalled: false,
+      ready: false,
+      away: false,
+    }));
+  }, [sync.peers, restPeers]);
+
+  const others = useMemo(
+    () =>
+      peers.filter(
+        (p) => p.name.toLowerCase() !== (user?.username ?? "").toLowerCase(),
+      ),
+    [peers, user?.username],
+  );
 
   const peerLabel = useMemo(() => {
-    if (!peers.length) return t("nobodyElse");
-    return `${t("connected")} : ${peers.join(", ")}`;
-  }, [peers, t]);
+    if (!others.length) return t("nobodyElse");
+    return others
+      .map((p) => {
+        if (p.away) {
+          const base = t("peerAway", { name: p.name });
+          return p.awayReason ? `${base} (${p.awayReason})` : base;
+        }
+        if (p.watching) return t("peerInRoom", { name: p.name });
+        return t("peerInCatalog", { name: p.name });
+      })
+      .join(" · ");
+  }, [others, t]);
 
   if (loading) {
     return (
@@ -134,7 +192,7 @@ export function App() {
             onClick={() => {
               void logout().then(() => {
                 setUser(null);
-                setActive(null);
+                goToCatalog();
               });
             }}
           >
@@ -150,7 +208,7 @@ export function App() {
               <button
                 className="ghost-btn"
                 type="button"
-                onClick={() => setActive(null)}
+                onClick={() => goToCatalog()}
               >
                 {t("backCatalog")}
               </button>
@@ -189,27 +247,39 @@ export function App() {
               </span>
             </div>
           </div>
+          {sync.lastError && <p className="error">{sync.lastError}</p>}
           <Player
+            key={active.id}
             movie={active}
             sync={sync}
             username={user.username}
             startAt={resumeAt}
           />
         </section>
+      ) : route.name === "watchlist" ? (
+        <section className="lobby">
+          <RoomNav route={route} peerLabel={peerLabel} />
+          <Watchlist username={user.username} />
+        </section>
+      ) : route.name === "nights" ? (
+        <section className="lobby">
+          <RoomNav route={route} peerLabel={peerLabel} />
+          <Nights />
+        </section>
       ) : (
         <section className="lobby">
+          <RoomNav route={route} peerLabel={peerLabel} />
           <div className="lobby-head">
             <div>
               <h1>{t("catalog")}</h1>
               <p>{t("catalogHint")}</p>
             </div>
-            <span className="pill">
-              <span className="dot" />
-              {peerLabel}
-            </span>
           </div>
 
-          {isAdmin && <UploadDropzone onUploaded={() => void refreshMovies()} />}
+          <UploadDropzone
+            onUploaded={() => void refreshMovies()}
+            subtitlesOnly={!isAdmin}
+          />
 
           {error && <p className="error">{error}</p>}
 
@@ -228,7 +298,7 @@ export function App() {
                   onOpen={(resume) => {
                     setResumeAt(resume ? m.progressTime : null);
                     setRoomBlurbOpen(false);
-                    setActive(m);
+                    goToMovie(m.id);
                   }}
                   onEdit={() => setEditing(m)}
                   onDelete={() => {
@@ -254,6 +324,36 @@ export function App() {
 
       <SiteCredit />
     </div>
+  );
+}
+
+function RoomNav({ route, peerLabel }: { route: Route; peerLabel: string }) {
+  const { t } = useI18n();
+  const tabs: { name: Route["name"]; hash: string; label: string }[] = [
+    { name: "catalog", hash: "#/", label: t("catalog") },
+    { name: "watchlist", hash: "#/watchlist", label: t("wishTab") },
+    { name: "nights", hash: "#/nights", label: t("nightsTab") },
+  ];
+  return (
+    <nav className="room-nav">
+      <div className="room-tabs" role="tablist">
+        {tabs.map((tab) => (
+          <a
+            key={tab.name}
+            href={tab.hash}
+            role="tab"
+            aria-selected={route.name === tab.name}
+            className={route.name === tab.name ? "is-active" : ""}
+          >
+            {tab.label}
+          </a>
+        ))}
+      </div>
+      <span className="pill">
+        <span className="dot" />
+        {peerLabel}
+      </span>
+    </nav>
   );
 }
 
